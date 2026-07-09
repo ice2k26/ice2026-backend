@@ -1,0 +1,5 @@
+node_modules/
+.DS_Store
+.clasp-credentials.json
+.clasprc.json
+**/src/Secret.js

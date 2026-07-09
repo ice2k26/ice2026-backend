@@ -1,0 +1,18 @@
+{
+  "name": "ice2026-auth",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ICE2026 auth — Google Apps Script web app",
+  "scripts": {
+    "push": "clasp push",
+    "pull": "clasp pull",
+    "status": "clasp status",
+    "deployments": "clasp list-deployments",
+    "deploy": "node deploy.js",
+    "open": "clasp open-script",
+    "logs": "clasp tail-logs"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.3.0"
+  }
+}
