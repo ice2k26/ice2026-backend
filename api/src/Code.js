@@ -11,6 +11,11 @@
  * Storage: one spreadsheet (auto-created on first use, ID kept in Script
  * Properties) with a tab per table. Images go to a Drive folder shared
  * link-viewable and are served via lh3.googleusercontent.com.
+ *
+ * Scopes: only https://www.googleapis.com/auth/drive.file — the app can touch
+ * ONLY the files it created itself. That's why all storage goes through the
+ * Sheets/Drive advanced services (SpreadsheetApp/DriveApp would demand the
+ * full drive + spreadsheets scopes).
  */
 
 var ADMIN_EMAILS = ['sankha@ahlab.org'];
@@ -215,10 +220,11 @@ var ACTIONS = {
     if (!/^image\//.test(mime)) return { ok: false, error: 'validation', message: 'Only images allowed.' };
     var bytes = Utilities.base64Decode(b64);
     if (bytes.length > MAX_UPLOAD_BYTES) return { ok: false, error: 'validation', message: 'Image must be under 5 MB.' };
-    var blob = Utilities.newBlob(bytes, mime, (clean_(params.filename, 80) || 'upload') + '-' + Date.now());
-    var file = uploadsFolder_().createFile(blob);
-    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-    return { url: 'https://lh3.googleusercontent.com/d/' + file.getId(), fileId: file.getId() };
+    var name = (clean_(params.filename, 80) || 'upload') + '-' + Date.now();
+    var blob = Utilities.newBlob(bytes, mime, name);
+    var file = Drive.Files.create({ name: name, parents: [uploadsFolderId_()] }, blob);
+    Drive.Permissions.create({ role: 'reader', type: 'anyone' }, file.id);
+    return { url: 'https://lh3.googleusercontent.com/d/' + file.id, fileId: file.id };
   },
 
   // ------------------------------------------------------------------ teams
@@ -574,42 +580,68 @@ function rowById_(table, id) {
 }
 
 // ------------------------------------------------------------ sheet plumbing
+// All storage via the Sheets/Drive ADVANCED SERVICES so the only OAuth scope
+// needed is drive.file (access limited to files this app created).
 
-function db_() {
+function colLetter_(n) {
+  var s = '';
+  while (n > 0) { s = String.fromCharCode(65 + ((n - 1) % 26)) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
+/** Spreadsheet ID — created on first use, with all tabs + header rows. */
+function dbId_() {
   var props = PropertiesService.getScriptProperties();
   var id = props.getProperty('DB_ID');
-  if (id) {
-    try { return SpreadsheetApp.openById(id); } catch (e) { /* recreate below */ }
-  }
+  if (id) return id;
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
     id = props.getProperty('DB_ID');
-    if (id) { try { return SpreadsheetApp.openById(id); } catch (e) { /* fall through */ } }
-    var ss = SpreadsheetApp.create(DB_NAME);
-    Object.keys(TABLES).forEach(function (name) {
-      var sheet = ss.getSheetByName(name) || ss.insertSheet(name);
-      sheet.appendRow(TABLES[name]);
-      sheet.setFrozenRows(1);
+    if (id) return id;
+    var names = Object.keys(TABLES);
+    var ss = Sheets.Spreadsheets.create({
+      properties: { title: DB_NAME },
+      sheets: names.map(function (name) {
+        return { properties: { title: name, gridProperties: { frozenRowCount: 1 } } };
+      }),
     });
-    var first = ss.getSheets()[0];
-    if (first.getName() === 'Sheet1') ss.deleteSheet(first);
-    props.setProperty('DB_ID', ss.getId());
-    return ss;
+    var gids = {};
+    (ss.sheets || []).forEach(function (sh) { gids[sh.properties.title] = sh.properties.sheetId; });
+    Sheets.Spreadsheets.Values.batchUpdate({
+      valueInputOption: 'RAW',
+      data: names.map(function (name) { return { range: name + '!A1', values: [TABLES[name]] }; }),
+    }, ss.spreadsheetId);
+    props.setProperty('DB_GIDS', JSON.stringify(gids));
+    props.setProperty('DB_ID', ss.spreadsheetId);
+    return ss.spreadsheetId;
   } finally {
     lock.releaseLock();
   }
 }
 
-function sheet_(name) {
-  var ss = db_();
-  var sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-    sheet.appendRow(TABLES[name]);
-    sheet.setFrozenRows(1);
+/** Numeric sheetId (gid) for a tab; creates the tab if missing. */
+function gid_(name) {
+  var props = PropertiesService.getScriptProperties();
+  var gids = {};
+  try { gids = JSON.parse(props.getProperty('DB_GIDS') || '{}'); } catch (e) { gids = {}; }
+  if (gids[name] !== undefined) return gids[name];
+  var meta = Sheets.Spreadsheets.get(dbId_(), { fields: 'sheets.properties' });
+  gids = {};
+  (meta.sheets || []).forEach(function (sh) { gids[sh.properties.title] = sh.properties.sheetId; });
+  if (gids[name] === undefined) {
+    var r = Sheets.Spreadsheets.batchUpdate({
+      requests: [{ addSheet: { properties: { title: name, gridProperties: { frozenRowCount: 1 } } } }],
+    }, dbId_());
+    gids[name] = r.replies[0].addSheet.properties.sheetId;
+    Sheets.Spreadsheets.Values.update({ values: [TABLES[name]] }, dbId_(), name + '!A1', { valueInputOption: 'RAW' });
   }
-  return sheet;
+  props.setProperty('DB_GIDS', JSON.stringify(gids));
+  return gids[name];
+}
+
+function tableRange_(name) {
+  return name + '!A2:' + colLetter_(TABLES[name].length);
 }
 
 /** Read a table as array of objects. Cached unless noCache. */
@@ -621,15 +653,15 @@ function readTable_(name, noCache) {
       try { return JSON.parse(hit); } catch (e) { /* refetch */ }
     }
   }
-  var sheet = sheet_(name);
-  var values = sheet.getDataRange().getValues();
   var headers = TABLES[name];
+  var resp = Sheets.Spreadsheets.Values.get(dbId_(), tableRange_(name));
+  var values = (resp && resp.values) || [];
   var rows = [];
-  for (var r = 1; r < values.length; r++) {
+  for (var r = 0; r < values.length; r++) {
     var obj = {};
     for (var c = 0; c < headers.length; c++) {
       var v = values[r][c];
-      obj[headers[c]] = v instanceof Date ? v.toISOString() : (v === null || v === undefined ? '' : String(v));
+      obj[headers[c]] = v === null || v === undefined ? '' : String(v);
     }
     if (obj.id) rows.push(obj);
   }
@@ -648,19 +680,24 @@ function appendRow_(name, obj) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    var sheet = sheet_(name);
     var headers = TABLES[name];
-    sheet.appendRow(headers.map(function (h) { return obj[h] !== undefined ? obj[h] : ''; }));
+    Sheets.Spreadsheets.Values.append(
+      { values: [headers.map(function (h) { return obj[h] !== undefined ? obj[h] : ''; })] },
+      dbId_(), name + '!A1',
+      { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' }
+    );
   } finally {
     lock.releaseLock();
   }
   invalidate_(name);
 }
 
-function findRowIndexById_(sheet, id) {
-  var ids = sheet.getRange(2, 1, Math.max(sheet.getLastRow() - 1, 1), 1).getValues();
+/** 1-based sheet row index for an id (header = row 1), or -1. */
+function findRowIndexById_(name, id) {
+  var resp = Sheets.Spreadsheets.Values.get(dbId_(), name + '!A2:A');
+  var ids = (resp && resp.values) || [];
   for (var i = 0; i < ids.length; i++) {
-    if (String(ids[i][0]) === String(id)) return i + 2; // 1-based + header
+    if (String(ids[i][0]) === String(id)) return i + 2;
   }
   return -1;
 }
@@ -669,14 +706,16 @@ function updateRowById_(name, id, patch) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    var sheet = sheet_(name);
-    var rowIdx = findRowIndexById_(sheet, id);
-    if (rowIdx === -1) throw new Error('Row not found in ' + name + ': ' + id);
     var headers = TABLES[name];
-    Object.keys(patch).forEach(function (key) {
-      var col = headers.indexOf(key);
-      if (col !== -1) sheet.getRange(rowIdx, col + 1).setValue(patch[key]);
+    var rowIdx = findRowIndexById_(name, id);
+    if (rowIdx === -1) throw new Error('Row not found in ' + name + ': ' + id);
+    var range = name + '!A' + rowIdx + ':' + colLetter_(headers.length) + rowIdx;
+    var resp = Sheets.Spreadsheets.Values.get(dbId_(), range);
+    var row = ((resp && resp.values) || [[]])[0] || [];
+    var merged = headers.map(function (h, i) {
+      return patch[h] !== undefined ? patch[h] : (row[i] !== undefined ? row[i] : '');
     });
+    Sheets.Spreadsheets.Values.update({ values: [merged] }, dbId_(), range, { valueInputOption: 'RAW' });
   } finally {
     lock.releaseLock();
   }
@@ -687,9 +726,14 @@ function deleteRowById_(name, id) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    var sheet = sheet_(name);
-    var rowIdx = findRowIndexById_(sheet, id);
-    if (rowIdx !== -1) sheet.deleteRow(rowIdx);
+    var rowIdx = findRowIndexById_(name, id);
+    if (rowIdx !== -1) {
+      Sheets.Spreadsheets.batchUpdate({
+        requests: [{ deleteDimension: { range: {
+          sheetId: gid_(name), dimension: 'ROWS', startIndex: rowIdx - 1, endIndex: rowIdx,
+        } } }],
+      }, dbId_());
+    }
   } finally {
     lock.releaseLock();
   }
@@ -706,34 +750,35 @@ function markMessagesRead_(ids) {
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    var sheet = sheet_('messages');
-    var headers = TABLES.messages;
-    var readCol = headers.indexOf('read') + 1;
-    var values = sheet.getRange(2, 1, Math.max(sheet.getLastRow() - 1, 1), 1).getValues();
-    for (var i = 0; i < values.length; i++) {
-      if (ids.indexOf(String(values[i][0])) !== -1) {
-        sheet.getRange(i + 2, readCol).setValue('true');
+    var readCol = colLetter_(TABLES.messages.indexOf('read') + 1);
+    var resp = Sheets.Spreadsheets.Values.get(dbId_(), 'messages!A2:A');
+    var rows = (resp && resp.values) || [];
+    var data = [];
+    for (var i = 0; i < rows.length; i++) {
+      if (ids.indexOf(String(rows[i][0])) !== -1) {
+        data.push({ range: 'messages!' + readCol + (i + 2), values: [['true']] });
       }
+    }
+    if (data.length) {
+      Sheets.Spreadsheets.Values.batchUpdate({ valueInputOption: 'RAW', data: data }, dbId_());
     }
   } finally {
     lock.releaseLock();
   }
 }
 
-function uploadsFolder_() {
+function uploadsFolderId_() {
   var props = PropertiesService.getScriptProperties();
   var id = props.getProperty('UPLOADS_FOLDER_ID');
-  if (id) {
-    try { return DriveApp.getFolderById(id); } catch (e) { /* recreate */ }
-  }
-  var folder = DriveApp.createFolder(UPLOADS_FOLDER_NAME);
-  props.setProperty('UPLOADS_FOLDER_ID', folder.getId());
-  return folder;
+  if (id) return id;
+  var folder = Drive.Files.create({ name: UPLOADS_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' });
+  props.setProperty('UPLOADS_FOLDER_ID', folder.id);
+  return folder.id;
 }
 
-/** Run once from the IDE to authorize scopes and create the database. */
+/** Run once from the IDE to authorize the (drive.file) scope and create the database. */
 function setup() {
-  var ss = db_();
-  console.log('Database ready: ' + ss.getUrl());
-  console.log('Uploads folder: ' + uploadsFolder_().getName());
+  var id = dbId_();
+  console.log('Database ready: https://docs.google.com/spreadsheets/d/' + id);
+  console.log('Uploads folder id: ' + uploadsFolderId_());
 }
