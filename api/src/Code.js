@@ -134,9 +134,13 @@ var AUTH_REQUIRED = {
 };
 
 var ADMIN_REQUIRED = {
-  ann_create: 1, ann_update: 1, ann_delete: 1,
   admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1,
 };
+
+// Mentors and admins may post announcements; edit/delete is author-or-admin.
+function canAnnounce_(ctx) {
+  return !!(ctx.isAdmin || (ctx.user && ctx.user.role === 'mentor'));
+}
 
 var ACTIONS = {
 
@@ -146,8 +150,12 @@ var ACTIONS = {
   bootstrap: function (params, ctx) {
     var users = readTable_('users').map(function (u) { return projectUser_(u, ctx); });
     var teams = readTable_('teams').map(parseTeam_);
+    // Everyone sees published announcements; authors also see their own drafts,
+    // and admins see every draft.
     var announcements = readTable_('announcements')
-      .filter(function (a) { return truthy_(a.isPublished); })
+      .filter(function (a) {
+        return truthy_(a.isPublished) || ctx.isAdmin || (ctx.user && a.authorId === ctx.user.id);
+      })
       .map(parseAnnouncement_);
     var unread = 0;
     if (ctx.user) {
@@ -160,6 +168,8 @@ var ACTIONS = {
       registrationOpen: getConfig_('REGISTRATION_OPEN', 'true') === 'true',
       me: ctx.user ? projectUser_(ctx.user, ctx, true) : null,
       isAdmin: !!ctx.isAdmin,
+      // Link to the backing spreadsheet — admins only.
+      dbUrl: ctx.isAdmin ? ('https://docs.google.com/spreadsheets/d/' + dbId_() + '/edit') : undefined,
       unread: unread,
       users: users,
       teams: teams,
@@ -428,6 +438,7 @@ var ACTIONS = {
   // ---------------------------------------------------------- announcements
 
   ann_create: function (params, ctx) {
+    if (!canAnnounce_(ctx)) return { ok: false, error: 'forbidden', message: 'Only mentors and organizers can post announcements.' };
     var title = clean_(params.title, 200);
     var content = clean_(params.content, 5000);
     if (!title || !content) return { ok: false, error: 'validation', message: 'Title and content are required.' };
@@ -438,8 +449,9 @@ var ACTIONS = {
       content: content,
       type: ['general', 'important', 'urgent'].indexOf(params.type) !== -1 ? params.type : 'general',
       authorId: ctx.user ? ctx.user.id : ctx.email,
-      isPinned: truthy_(params.isPinned) ? 'true' : 'false',
-      isPublished: 'true',
+      // Only admins may pin (global priority); default published unless saved as a draft.
+      isPinned: (ctx.isAdmin && truthy_(params.isPinned)) ? 'true' : 'false',
+      isPublished: (params.isPublished === undefined || truthy_(params.isPublished)) ? 'true' : 'false',
       createdAt: now,
       updatedAt: now,
     };
@@ -450,17 +462,25 @@ var ACTIONS = {
   ann_update: function (params, ctx) {
     var ann = rowById_('announcements', params.id);
     if (!ann) return { ok: false, error: 'notfound', message: 'Announcement not found.' };
+    if (!ctx.isAdmin && !(ctx.user && ann.authorId === ctx.user.id)) {
+      return { ok: false, error: 'forbidden', message: 'You can only edit your own announcements.' };
+    }
     var patch = { updatedAt: new Date().toISOString() };
     if (params.title !== undefined) patch.title = clean_(params.title, 200);
     if (params.content !== undefined) patch.content = clean_(params.content, 5000);
     if (params.type !== undefined && ['general', 'important', 'urgent'].indexOf(params.type) !== -1) patch.type = params.type;
-    if (params.isPinned !== undefined) patch.isPinned = truthy_(params.isPinned) ? 'true' : 'false';
+    if (params.isPinned !== undefined && ctx.isAdmin) patch.isPinned = truthy_(params.isPinned) ? 'true' : 'false';
     if (params.isPublished !== undefined) patch.isPublished = truthy_(params.isPublished) ? 'true' : 'false';
     updateRowById_('announcements', ann.id, patch);
     return { announcement: parseAnnouncement_(rowById_('announcements', ann.id)) };
   },
 
   ann_delete: function (params, ctx) {
+    var ann = rowById_('announcements', params.id);
+    if (!ann) return {};
+    if (!ctx.isAdmin && !(ctx.user && ann.authorId === ctx.user.id)) {
+      return { ok: false, error: 'forbidden', message: 'You can only delete your own announcements.' };
+    }
     deleteRowById_('announcements', params.id);
     return {};
   },
