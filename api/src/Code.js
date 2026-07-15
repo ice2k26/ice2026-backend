@@ -32,6 +32,19 @@ var TABLES = {
   team_posts: ['id', 'teamId', 'createdBy', 'content', 'createdAt'],
   messages: ['id', 'senderId', 'receiverId', 'content', 'read', 'createdAt'],
   announcements: ['id', 'title', 'content', 'type', 'authorId', 'isPinned', 'isPublished', 'createdAt', 'updatedAt'],
+  options: ['category', 'value'],
+};
+
+// Seeded into the "options" tab on first read so admins have rows to edit.
+// Admins manage form choices by editing that tab directly (category | value).
+var DEFAULT_OPTIONS = {
+  skill: [
+    'UX', 'Interaction Design', 'Study Design', 'Data Science', 'Data Analytics',
+    'Machine Learning', 'Hardware', 'Embedded Systems', 'Mobile Apps', 'Web Development',
+    'Fundraising', 'Pitch Deck', 'Strategy', 'Business', 'Content Writing',
+    'Figma', '3D Printing', 'Electronics', 'Computer Vision', 'Prototyping',
+  ],
+  gender: ['Female', 'Male', 'Non-binary', 'Prefer not to say'],
 };
 
 var USER_PUBLIC_FIELDS = ['id', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'links', 'video', 'role', 'createdAt'];
@@ -151,6 +164,7 @@ var ACTIONS = {
       users: users,
       teams: teams,
       announcements: announcements,
+      options: readOptions_(),
     };
   },
 
@@ -765,6 +779,38 @@ function markMessagesRead_(ids) {
   } finally {
     lock.releaseLock();
   }
+}
+
+/** Form options from the "options" tab, grouped by category. Seeds defaults
+ *  on first read; rows without an id column so admins can just type values. */
+function readOptions_() {
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get('tbl_options');
+  if (hit) {
+    try { return JSON.parse(hit); } catch (e) { /* refetch */ }
+  }
+  gid_('options'); // ensure the tab exists (creates it with the header row)
+  var resp = Sheets.Spreadsheets.Values.get(dbId_(), 'options!A2:B');
+  var values = (resp && resp.values) || [];
+  if (!values.length) {
+    var rows = [];
+    Object.keys(DEFAULT_OPTIONS).forEach(function (cat) {
+      DEFAULT_OPTIONS[cat].forEach(function (v) { rows.push([cat, v]); });
+    });
+    Sheets.Spreadsheets.Values.append({ values: rows }, dbId_(), 'options!A1',
+      { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' });
+    values = rows;
+  }
+  var out = {};
+  values.forEach(function (r) {
+    var cat = String(r[0] || '').trim().toLowerCase();
+    var val = String((r[1] === undefined ? '' : r[1])).trim();
+    if (!cat || !val) return;
+    if (!out[cat]) out[cat] = [];
+    if (out[cat].indexOf(val) === -1) out[cat].push(val);
+  });
+  cache.put('tbl_options', JSON.stringify(out), CACHE_TTL_SECONDS);
+  return out;
 }
 
 function uploadsFolderId_() {

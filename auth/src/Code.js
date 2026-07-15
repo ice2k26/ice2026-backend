@@ -15,7 +15,7 @@ var TOKEN_TTL_DAYS = 30;
 
 // Redirect allowlist — token is only ever handed to these origins.
 var ALLOWED_REDIRECT_PREFIXES = [
-  'https://ice2k26.github.io/',
+  'https://ice2026.designthinking.lk/',
   'http://localhost:',
   'http://127.0.0.1:',
 ];
