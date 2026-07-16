@@ -1,5 +1,5 @@
 /**
- * ICE2026 API — JSON backend over Google Sheets.
+ * ICE API — JSON backend over Google Sheets, serving MULTIPLE projects.
  *
  * Deployed as: execute as USER_DEPLOYING (owner), access ANYONE_ANONYMOUS.
  * The frontend (static site on GitHub Pages) talks to this endpoint with
@@ -8,25 +8,53 @@
  * Auth: bearer tokens minted by the sibling "auth" web app, HMAC-signed with
  * the shared SECRET (Secret.js — git-ignored, present in both projects).
  *
- * Storage: one spreadsheet (auto-created on first use, ID kept in Script
- * Properties) with a tab per table. Images go to a Drive folder shared
- * link-viewable and are served via lh3.googleusercontent.com.
+ * Storage: a central REGISTRY spreadsheet (auto-created on first use, ID kept
+ * in Script Properties) lists every project (workshop instance — ice2026,
+ * ice2027, test runs…) and holds a cross-project people directory. Each
+ * project row points at its own database spreadsheet + Drive uploads folder,
+ * both auto-created on first use. Every request carries a `project` slug;
+ * omitting it falls back to DEFAULT_PROJECT so pre-multi-project clients
+ * keep working. Images are served via lh3.googleusercontent.com.
  *
  * Scopes: only https://www.googleapis.com/auth/drive.file — the app can touch
  * ONLY the files it created itself. That's why all storage goes through the
  * Sheets/Drive advanced services (SpreadsheetApp/DriveApp would demand the
- * full drive + spreadsheets scopes).
+ * full drive + spreadsheets scopes), and why "add project" always CREATES
+ * sheets — an existing spreadsheet can never be linked in.
  */
 
 var ADMIN_EMAILS = ['sankha@ahlab.org'];
 
-var DB_NAME = 'ICE2026 Database';
-var UPLOADS_FOLDER_NAME = 'ICE2026 Uploads';
+var DEFAULT_PROJECT = 'ice2026';
+var REGISTRY_NAME = 'ICE Projects Registry';
+var PROJECT_SLUG_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
+
+// The registry spreadsheet's tabs. `projects`: one row per workshop instance
+// (per-project config + storage pointers). `directory`: one row per person,
+// keyed by the personal email they sign in with — carries their minted
+// @designthinking.lk account and a profile snapshot across projects.
+var REGISTRY_TABS = {
+  projects: ['id', 'name', 'tagline', 'siteUrl', 'status', 'registrationOpen', 'provisionAccounts', 'dbId', 'uploadsFolderId', 'createdAt', 'updatedAt'],
+  directory: ['email', 'workEmail', 'name', 'lastProjectId', 'profile', 'updatedAt'],
+};
+
+// The project this invocation operates on — resolved from params.project at
+// the top of handle_(). A plain global is safe: Apps Script never shares
+// globals between concurrent invocations. IDE-run functions must set it too.
+var PROJ = null;
+
 var MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 var CACHE_TTL_SECONDS = 60;
 
+// Workshop Google Workspace: on registration we mint firstname@designthinking.lk
+// (a verified secondary domain in the ahlab.org Workspace) inside the /ICE org
+// unit, so participants can DM each other in real Google Chat. See README.
+var WORKSPACE_DOMAIN = 'designthinking.lk';
+var WORKSPACE_OU = '/ICE';
+
+// workEmail = the minted @designthinking.lk address (blank until provisioned).
 var TABLES = {
-  users: ['id', 'email', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'gender', 'links', 'video', 'role', 'createdAt', 'updatedAt'],
+  users: ['id', 'email', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'gender', 'links', 'video', 'role', 'createdAt', 'updatedAt', 'workEmail'],
   teams: ['id', 'name', 'description', 'coverImage', 'lookingFor', 'creatorId', 'members', 'createdAt', 'updatedAt'],
   team_links: ['id', 'teamId', 'createdBy', 'title', 'url', 'description', 'createdAt'],
   team_posts: ['id', 'teamId', 'createdBy', 'content', 'createdAt'],
@@ -47,7 +75,8 @@ var DEFAULT_OPTIONS = {
   gender: ['Female', 'Male', 'Non-binary', 'Prefer not to say'],
 };
 
-var USER_PUBLIC_FIELDS = ['id', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'links', 'video', 'role', 'createdAt'];
+// workEmail is public: it's a workshop chat handle other participants DM.
+var USER_PUBLIC_FIELDS = ['id', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'links', 'video', 'role', 'createdAt', 'workEmail'];
 
 // ---------------------------------------------------------------- entrypoints
 
@@ -71,11 +100,17 @@ function handle_(params) {
     var fn = ACTIONS[action];
     if (!fn) return json_({ ok: false, error: 'Unknown action: ' + action });
 
+    var slug = String(params.project || DEFAULT_PROJECT).toLowerCase();
+    PROJ = getProject_(slug);
+    if (!PROJ && action !== 'ping') {
+      return json_({ ok: false, error: 'unknown_project', message: 'Unknown project: ' + slug });
+    }
+
     var ctx = { email: null, user: null, isAdmin: false };
     var email = verifyToken_(params.token);
     if (email) {
       ctx.email = email;
-      ctx.user = findUserByEmail_(email);
+      ctx.user = PROJ ? findUserByEmail_(email) : null;
       ctx.isAdmin = isAdminEmail_(email) || (ctx.user && ctx.user.role === 'admin');
     }
 
@@ -125,16 +160,18 @@ function isAdminEmail_(email) {
 // ------------------------------------------------------------------- actions
 
 var AUTH_REQUIRED = {
-  me: 1, register: 1, update_profile: 1, upload_image: 1,
+  me: 1, register: 1, update_profile: 1, upload_image: 1, check_url: 1, check_email: 1,
   create_team: 1, update_team: 1, delete_team: 1, join_team: 1, leave_team: 1,
   team_link_add: 1, team_link_delete: 1, team_post_add: 1,
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
   ann_create: 1, ann_update: 1, ann_delete: 1,
-  admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1,
+  admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
+  admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
 var ADMIN_REQUIRED = {
-  admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1,
+  admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
+  admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
 // Mentors and admins may post announcements; edit/delete is author-or-admin.
@@ -145,6 +182,48 @@ function canAnnounce_(ctx) {
 var ACTIONS = {
 
   ping: function () { return { pong: true, now: new Date().toISOString() }; },
+
+  /** Server-side reachability check for a profile link (no CORS). Returns exists:
+   *  true unless the host doesn't resolve or replies 404/410. Bot-blocked hosts
+   *  (LinkedIn 999, 401/403) count as existing — the page is there, it just won't
+   *  talk to a crawler. Auth-gated so it can't be used as an open proxy. */
+  check_url: function (params, ctx) {
+    var url = clean_(params.url, 500);
+    if (!/^https?:\/\//i.test(url)) return { exists: false, reason: 'format' };
+    try {
+      var resp = UrlFetchApp.fetch(url, {
+        method: 'get',
+        followRedirects: true,
+        muteHttpExceptions: true,
+        validateHttpsCertificates: true,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ICE-linkcheck/1.0; +https://ice.designthinking.lk)' },
+      });
+      var code = resp.getResponseCode();
+      return { exists: !(code === 404 || code === 410), status: code };
+    } catch (err) {
+      // DNS failure, connection refused, timeout, bad certificate → treat as gone.
+      return { exists: false, reason: 'unreachable', message: String((err && err.message) || err) };
+    }
+  },
+
+  /** Is a workshop email free? Used by the register form to show the address the
+   *  new account will get. available:true when no Workspace account holds it.
+   *  Uses admin.directory.user (Users.get) — no extra scope. */
+  check_email: function (params, ctx) {
+    var email = clean_(params.email, 120).toLowerCase();
+    if (!new RegExp('^[a-z0-9][a-z0-9._-]*@' + WORKSPACE_DOMAIN.replace(/\./g, '\\.') + '$').test(email)) {
+      return { available: false, reason: 'format' };
+    }
+    try {
+      if (typeof AdminDirectory === 'undefined') return { available: false, reason: 'unavailable' };
+      AdminDirectory.Users.get(email); // throws 404 if the account doesn't exist
+      return { available: false, email: email }; // exists → taken
+    } catch (err) {
+      var m = String((err && err.message) || err);
+      if (/not\s*found|404|does not exist|resource/i.test(m)) return { available: true, email: email };
+      return { available: false, reason: 'error', message: m };
+    }
+  },
 
   /** One-shot payload for the frontend: directory + teams + announcements. */
   bootstrap: function (params, ctx) {
@@ -164,12 +243,25 @@ var ACTIONS = {
         return m.receiverId === myId && !truthy_(m.read);
       }).length;
     }
+    // Returning person: signed in and known in the cross-project directory but
+    // not yet registered in THIS project — hand the frontend their existing
+    // work account + last profile so the register form starts prefilled.
+    var prefill = null;
+    if (ctx.email && !ctx.user) {
+      var dir = findDirectory_(ctx.email);
+      if (dir) prefill = { workEmail: dir.workEmail || '', profile: safeParse_(dir.profile) };
+    }
     return {
-      registrationOpen: getConfig_('REGISTRATION_OPEN', 'true') === 'true',
+      registrationOpen: PROJ.registrationOpen,
       me: ctx.user ? projectUser_(ctx.user, ctx, true) : null,
       isAdmin: !!ctx.isAdmin,
-      // Link to the backing spreadsheet — admins only.
+      project: projectPublic_(),
+      projects: listVisibleProjects_(ctx),
+      prefill: prefill,
+      // Links to the backing spreadsheet + uploads Drive folder — admins only.
       dbUrl: ctx.isAdmin ? ('https://docs.google.com/spreadsheets/d/' + dbId_() + '/edit') : undefined,
+      uploadsUrl: ctx.isAdmin ? ('https://drive.google.com/drive/folders/' + uploadsFolderId_()) : undefined,
+      registryUrl: (ctx.email && isAdminEmail_(ctx.email)) ? ('https://docs.google.com/spreadsheets/d/' + registryId_() + '/edit') : undefined,
       unread: unread,
       users: users,
       teams: teams,
@@ -189,12 +281,32 @@ var ACTIONS = {
 
   register: function (params, ctx) {
     if (ctx.user) return { ok: false, error: 'exists', message: 'You are already registered.' };
-    if (getConfig_('REGISTRATION_OPEN', 'true') !== 'true' && !ctx.isAdmin) {
+    if (!PROJ.registrationOpen && !ctx.isAdmin) {
       return { ok: false, error: 'closed', message: 'Registration is closed.' };
     }
-    var name = clean_(params.name, 100);
+    var first = clean_(params.firstName, 50);
+    var last = clean_(params.lastName, 50);
+    var name = clean_(params.name, 100) || (first + ' ' + last).trim();
     if (!name) return { ok: false, error: 'validation', message: 'Name is required.' };
+    if (!first) { // client sent only a combined name — split it for the email handle
+      var parts = name.split(/\s+/);
+      first = parts.shift() || '';
+      last = parts.join(' ');
+    }
     var now = new Date().toISOString();
+    // Workshop @designthinking.lk account: returning people (in the directory)
+    // keep the one they already have — no duplicate mint, no new password.
+    // Otherwise mint one, unless this project has provisioning switched off
+    // (test projects). Guarded: registration still succeeds (workEmail just
+    // stays blank) if provisioning fails for any reason.
+    var dir = findDirectory_(ctx.email);
+    var workEmail = '';
+    if (dir && dir.workEmail) {
+      workEmail = dir.workEmail;
+      sendWorkspaceWelcomeBack_(ctx.email, first, workEmail);
+    } else if (PROJ.provisionAccounts) {
+      workEmail = provisionWorkspaceAccount_(first, last, ctx.email);
+    }
     var user = {
       id: Utilities.getUuid(),
       email: ctx.email,
@@ -210,8 +322,15 @@ var ACTIONS = {
       role: isAdminEmail_(ctx.email) ? 'admin' : 'participant',
       createdAt: now,
       updatedAt: now,
+      workEmail: workEmail,
     };
     appendRow_('users', user);
+    upsertDirectory_(ctx.email, {
+      workEmail: workEmail,
+      name: name,
+      lastProjectId: PROJ.id,
+      profile: JSON.stringify(profileSnapshot_(user)),
+    });
     return { user: projectUser_(user, { isAdmin: true }, true) };
   },
 
@@ -233,6 +352,12 @@ var ACTIONS = {
     if (params.video !== undefined) patch.video = clean_(params.video, 300);
     updateRowById_('users', ctx.user.id, patch);
     var updated = findUserByEmail_(ctx.email);
+    // Keep the cross-project directory snapshot tracking their latest profile.
+    upsertDirectory_(ctx.email, {
+      name: updated.name,
+      lastProjectId: PROJ.id,
+      profile: JSON.stringify(profileSnapshot_(updated)),
+    });
     return { user: projectUser_(updated, ctx, true) };
   },
 
@@ -514,9 +639,102 @@ var ACTIONS = {
 
   admin_set_config: function (params, ctx) {
     if (params.registrationOpen !== undefined) {
-      setConfig_('REGISTRATION_OPEN', truthy_(params.registrationOpen) ? 'true' : 'false');
+      var open = truthy_(params.registrationOpen);
+      updateRegistryRowByKey_('projects', PROJ.id, {
+        registrationOpen: open ? 'true' : 'false',
+        updatedAt: new Date().toISOString(),
+      });
+      PROJ.registrationOpen = open;
     }
-    return { registrationOpen: getConfig_('REGISTRATION_OPEN', 'true') === 'true' };
+    return { registrationOpen: PROJ.registrationOpen };
+  },
+
+  // (Re)mint a workshop @designthinking.lk account for a user who has none —
+  // for rows that registered before provisioning existed, or where it failed.
+  // Reuses the account from a previous project when the directory has one.
+  admin_provision_email: function (params, ctx) {
+    var u = rowById_('users', params.userId);
+    if (!u) return { ok: false, error: 'notfound', message: 'User not found.' };
+    if (u.workEmail) return { workEmail: u.workEmail };
+    var dir = findDirectory_(u.email);
+    var workEmail = (dir && dir.workEmail) || '';
+    if (workEmail) {
+      var first0 = String(u.name || '').trim().split(/\s+/)[0] || '';
+      sendWorkspaceWelcomeBack_(u.email, first0, workEmail);
+    } else {
+      if (!PROJ.provisionAccounts) {
+        return { ok: false, error: 'disabled', message: 'Account provisioning is switched off for this project.' };
+      }
+      var parts = String(u.name || '').trim().split(/\s+/).filter(Boolean);
+      var first = parts.shift() || '';
+      var last = parts.join(' ');
+      workEmail = provisionWorkspaceAccount_(first, last, u.email);
+      if (!workEmail) return { ok: false, error: 'provision', message: 'Could not create the account — check the Admin SDK setup and the execution logs.' };
+    }
+    updateRowById_('users', u.id, { workEmail: workEmail, updatedAt: new Date().toISOString() });
+    upsertDirectory_(u.email, { workEmail: workEmail, name: u.name, lastProjectId: PROJ.id });
+    return { workEmail: workEmail };
+  },
+
+  // -------------------------------------------------- project management
+  // Creating/listing projects is for GLOBAL admins (ADMIN_EMAILS) — a
+  // per-project admin must not be able to spawn or enumerate projects.
+  // admin_update_project edits the CURRENT project and is open to its admins.
+
+  admin_list_projects: function (params, ctx) {
+    if (!isAdminEmail_(ctx.email)) return { ok: false, error: 'forbidden', message: 'Global admins only.' };
+    return { projects: readRegistry_('projects', true) };
+  },
+
+  admin_create_project: function (params, ctx) {
+    if (!isAdminEmail_(ctx.email)) return { ok: false, error: 'forbidden', message: 'Global admins only.' };
+    var id = clean_(params.id, 30).toLowerCase();
+    if (!PROJECT_SLUG_RE.test(id)) {
+      return { ok: false, error: 'validation', message: 'Project id must be 2–30 chars: lowercase letters, digits, hyphens.' };
+    }
+    if (getProject_(id, true)) return { ok: false, error: 'exists', message: 'A project with that id already exists.' };
+    var name = clean_(params.name, 60);
+    if (!name) return { ok: false, error: 'validation', message: 'Project name is required.' };
+    var now = new Date().toISOString();
+    var row = {
+      id: id,
+      name: name,
+      tagline: clean_(params.tagline, 200),
+      siteUrl: clean_(params.siteUrl, 200),
+      status: params.status === 'test' ? 'test' : 'active',
+      registrationOpen: 'true',
+      provisionAccounts: truthy_(params.provisionAccounts) ? 'true' : 'false',
+      // Database spreadsheet + uploads folder are created lazily on the
+      // project's first use (dbId_ / uploadsFolderId_ write them back here).
+      dbId: '',
+      uploadsFolderId: '',
+      createdAt: now,
+      updatedAt: now,
+    };
+    appendRegistryRow_('projects', row);
+    return { project: row };
+  },
+
+  admin_update_project: function (params, ctx) {
+    var patch = { updatedAt: new Date().toISOString() };
+    if (params.name !== undefined) {
+      var name = clean_(params.name, 60);
+      if (!name) return { ok: false, error: 'validation', message: 'Project name cannot be empty.' };
+      patch.name = name;
+    }
+    if (params.tagline !== undefined) patch.tagline = clean_(params.tagline, 200);
+    if (params.siteUrl !== undefined) patch.siteUrl = clean_(params.siteUrl, 200);
+    if (params.status !== undefined) {
+      if (['active', 'test', 'archived'].indexOf(params.status) === -1) {
+        return { ok: false, error: 'validation', message: 'Status must be active, test or archived.' };
+      }
+      patch.status = params.status;
+    }
+    if (params.registrationOpen !== undefined) patch.registrationOpen = truthy_(params.registrationOpen) ? 'true' : 'false';
+    if (params.provisionAccounts !== undefined) patch.provisionAccounts = truthy_(params.provisionAccounts) ? 'true' : 'false';
+    updateRegistryRowByKey_('projects', PROJ.id, patch);
+    PROJ = getProject_(PROJ.id, true);
+    return { project: projectPublic_() };
   },
 };
 
@@ -547,6 +765,48 @@ function parseAnnouncement_(a) {
   out.isPinned = truthy_(a.isPinned);
   out.isPublished = truthy_(a.isPublished);
   return out;
+}
+
+/** The current project as the frontend sees it (no storage IDs). */
+function projectPublic_() {
+  return {
+    id: PROJ.id,
+    name: PROJ.name,
+    tagline: PROJ.tagline,
+    siteUrl: PROJ.siteUrl,
+    status: PROJ.status,
+    registrationOpen: PROJ.registrationOpen,
+    provisionAccounts: PROJ.provisionAccounts,
+  };
+}
+
+/** Projects for the switcher dropdown. Everyone sees active ones; test
+ *  projects only show for admins; archived only for global admins. */
+function listVisibleProjects_(ctx) {
+  var globalAdmin = !!(ctx.email && isAdminEmail_(ctx.email));
+  return readRegistry_('projects')
+    .filter(function (p) {
+      var status = p.status || 'active';
+      if (status === 'active') return true;
+      if (status === 'test') return !!ctx.isAdmin || globalAdmin;
+      return globalAdmin; // archived
+    })
+    .map(function (p) { return { id: p.id, name: p.name, status: p.status || 'active' }; });
+}
+
+/** The profile subset stored in the directory for cross-project prefill. */
+function profileSnapshot_(u) {
+  return {
+    name: u.name,
+    image: u.image,
+    bio: u.bio,
+    skills: parseArr_(u.skills),
+    affiliation: u.affiliation,
+    expertise: u.expertise,
+    gender: u.gender,
+    links: parseArr_(u.links),
+    video: u.video,
+  };
 }
 
 function canManageTeam_(team, ctx) {
@@ -592,8 +852,9 @@ function getConfig_(key, fallback) {
   return v === null ? fallback : v;
 }
 
-function setConfig_(key, value) {
-  PropertiesService.getScriptProperties().setProperty(key, value);
+function safeParse_(s) {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (e) { return null; }
 }
 
 function findUserByEmail_(email) {
@@ -613,6 +874,177 @@ function rowById_(table, id) {
   return null;
 }
 
+// ----------------------------------------------------------------- registry
+// The central registry spreadsheet (Script Property REGISTRY_ID) is the index
+// of all projects plus the cross-project people directory. Created lazily; on
+// creation the pre-multi-project Script Properties (DB_ID, UPLOADS_FOLDER_ID,
+// REGISTRATION_OPEN) seed the DEFAULT_PROJECT row, so an existing deployment
+// migrates itself on the first request after this code ships.
+
+function registryId_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('REGISTRY_ID');
+  if (id) return id;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    id = props.getProperty('REGISTRY_ID');
+    if (id) return id;
+    var names = Object.keys(REGISTRY_TABS);
+    var ss = Sheets.Spreadsheets.create({
+      properties: { title: REGISTRY_NAME },
+      sheets: names.map(function (name) {
+        return { properties: { title: name, gridProperties: { frozenRowCount: 1 } } };
+      }),
+    });
+    var data = names.map(function (name) { return { range: name + '!A1', values: [REGISTRY_TABS[name]] }; });
+    // Seed the default project. An existing single-project deployment donates
+    // its spreadsheet/folder/config; a fresh install gets blanks (created
+    // lazily on first use).
+    var now = new Date().toISOString();
+    data.push({ range: 'projects!A2', values: [[
+      DEFAULT_PROJECT, 'ICE2026', 'Innovation & Collaboration Experience',
+      'ice2026.designthinking.lk', 'active',
+      getConfig_('REGISTRATION_OPEN', 'true'), 'true',
+      props.getProperty('DB_ID') || '', props.getProperty('UPLOADS_FOLDER_ID') || '',
+      now, now,
+    ]] });
+    Sheets.Spreadsheets.Values.batchUpdate({ valueInputOption: 'RAW', data: data }, ss.spreadsheetId);
+    props.setProperty('REGISTRY_ID', ss.spreadsheetId);
+    return ss.spreadsheetId;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Read a registry tab as array of objects, keyed rows only. Cached. */
+function readRegistry_(tab, noCache) {
+  var cache = CacheService.getScriptCache();
+  if (!noCache) {
+    var hit = cache.get('reg_' + tab);
+    if (hit) {
+      try { return JSON.parse(hit); } catch (e) { /* refetch */ }
+    }
+  }
+  var headers = REGISTRY_TABS[tab];
+  var resp = Sheets.Spreadsheets.Values.get(registryId_(), tab + '!A2:' + colLetter_(headers.length));
+  var values = (resp && resp.values) || [];
+  var rows = [];
+  for (var r = 0; r < values.length; r++) {
+    var obj = {};
+    for (var c = 0; c < headers.length; c++) {
+      var v = values[r][c];
+      obj[headers[c]] = v === null || v === undefined ? '' : String(v);
+    }
+    if (obj[headers[0]]) rows.push(obj); // key column (id / email) must be set
+  }
+  if (!noCache) {
+    var s = JSON.stringify(rows);
+    if (s.length < 90000) cache.put('reg_' + tab, s, CACHE_TTL_SECONDS);
+  }
+  return rows;
+}
+
+function invalidateRegistry_(tab) {
+  CacheService.getScriptCache().remove('reg_' + tab);
+}
+
+function appendRegistryRow_(tab, obj) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var headers = REGISTRY_TABS[tab];
+    Sheets.Spreadsheets.Values.append(
+      { values: [headers.map(function (h) { return obj[h] !== undefined ? obj[h] : ''; })] },
+      registryId_(), tab + '!A1',
+      { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' }
+    );
+  } finally {
+    lock.releaseLock();
+  }
+  invalidateRegistry_(tab);
+}
+
+/** Patch a registry row found by its key column (first header, case-insensitive). */
+function updateRegistryRowByKey_(tab, keyVal, patch) {
+  var found = false;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    found = updateRegistryRowUnlocked_(tab, keyVal, patch);
+  } finally {
+    lock.releaseLock();
+  }
+  invalidateRegistry_(tab);
+  return found;
+}
+
+/** Lock-free inner write for callers that ALREADY hold the script lock
+ *  (dbId_/uploadsFolderId_) — LockService re-entrancy is undefined. */
+function updateRegistryRowUnlocked_(tab, keyVal, patch) {
+  var headers = REGISTRY_TABS[tab];
+  var resp = Sheets.Spreadsheets.Values.get(registryId_(), tab + '!A2:A');
+  var keys = (resp && resp.values) || [];
+  var rowIdx = -1;
+  for (var i = 0; i < keys.length; i++) {
+    if (String(keys[i][0]).toLowerCase() === String(keyVal).toLowerCase()) { rowIdx = i + 2; break; }
+  }
+  if (rowIdx === -1) return false;
+  var range = tab + '!A' + rowIdx + ':' + colLetter_(headers.length) + rowIdx;
+  var cur = ((Sheets.Spreadsheets.Values.get(registryId_(), range) || {}).values || [[]])[0] || [];
+  var merged = headers.map(function (h, c) {
+    return patch[h] !== undefined ? patch[h] : (cur[c] !== undefined ? cur[c] : '');
+  });
+  Sheets.Spreadsheets.Values.update({ values: [merged] }, registryId_(), range, { valueInputOption: 'RAW' });
+  return true;
+}
+
+/** Registry row for a project slug, with booleans parsed. */
+function getProject_(slug, noCache) {
+  var rows = readRegistry_('projects', noCache);
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id === slug) {
+      var p = rows[i];
+      return {
+        id: p.id,
+        name: p.name,
+        tagline: p.tagline,
+        siteUrl: p.siteUrl,
+        status: p.status || 'active',
+        registrationOpen: truthy_(p.registrationOpen),
+        provisionAccounts: truthy_(p.provisionAccounts),
+        dbId: p.dbId,
+        uploadsFolderId: p.uploadsFolderId,
+      };
+    }
+  }
+  return null;
+}
+
+/** Directory row for a personal email, or null. */
+function findDirectory_(email) {
+  var key = String(email || '').toLowerCase();
+  if (!key) return null;
+  var rows = readRegistry_('directory');
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i].email).toLowerCase() === key) return rows[i];
+  }
+  return null;
+}
+
+/** Insert-or-patch a directory row. Fields not in patch are preserved. */
+function upsertDirectory_(email, patch) {
+  var key = String(email || '').toLowerCase();
+  if (!key) return;
+  patch.updatedAt = new Date().toISOString();
+  if (findDirectory_(key)) {
+    updateRegistryRowByKey_('directory', key, patch);
+  } else {
+    patch.email = key;
+    appendRegistryRow_('directory', patch);
+  }
+}
+
 // ------------------------------------------------------------ sheet plumbing
 // All storage via the Sheets/Drive ADVANCED SERVICES so the only OAuth scope
 // needed is drive.file (access limited to files this app created).
@@ -623,19 +1055,20 @@ function colLetter_(n) {
   return s;
 }
 
-/** Spreadsheet ID — created on first use, with all tabs + header rows. */
+/** The current project's spreadsheet ID — created on first use, with all tabs
+ *  + header rows, and written back to the project's registry row. */
 function dbId_() {
-  var props = PropertiesService.getScriptProperties();
-  var id = props.getProperty('DB_ID');
-  if (id) return id;
+  if (!PROJ) throw new Error('No project resolved — set PROJ before touching storage.');
+  if (PROJ.dbId) return PROJ.dbId;
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    id = props.getProperty('DB_ID');
-    if (id) return id;
+    // Another invocation may have created it while we waited for the lock.
+    var fresh = getProject_(PROJ.id, true);
+    if (fresh && fresh.dbId) { PROJ.dbId = fresh.dbId; return PROJ.dbId; }
     var names = Object.keys(TABLES);
     var ss = Sheets.Spreadsheets.create({
-      properties: { title: DB_NAME },
+      properties: { title: PROJ.name + ' Database' },
       sheets: names.map(function (name) {
         return { properties: { title: name, gridProperties: { frozenRowCount: 1 } } };
       }),
@@ -646,19 +1079,26 @@ function dbId_() {
       valueInputOption: 'RAW',
       data: names.map(function (name) { return { range: name + '!A1', values: [TABLES[name]] }; }),
     }, ss.spreadsheetId);
-    props.setProperty('DB_GIDS', JSON.stringify(gids));
-    props.setProperty('DB_ID', ss.spreadsheetId);
-    return ss.spreadsheetId;
+    PropertiesService.getScriptProperties().setProperty('DB_GIDS_' + PROJ.id, JSON.stringify(gids));
+    updateRegistryRowUnlocked_('projects', PROJ.id, { dbId: ss.spreadsheetId, updatedAt: new Date().toISOString() });
+    invalidateRegistry_('projects');
+    PROJ.dbId = ss.spreadsheetId;
+    return PROJ.dbId;
   } finally {
     lock.releaseLock();
   }
 }
 
-/** Numeric sheetId (gid) for a tab; creates the tab if missing. */
+/** Numeric sheetId (gid) for a tab of the current project's DB; creates the
+ *  tab if missing. Gid maps are cached per project in Script Properties. */
 function gid_(name) {
   var props = PropertiesService.getScriptProperties();
+  var key = 'DB_GIDS_' + PROJ.id;
+  var raw = props.getProperty(key);
+  // Pre-multi-project deployments stored the default project's map as DB_GIDS.
+  if (!raw && PROJ.id === DEFAULT_PROJECT) raw = props.getProperty('DB_GIDS');
   var gids = {};
-  try { gids = JSON.parse(props.getProperty('DB_GIDS') || '{}'); } catch (e) { gids = {}; }
+  try { gids = JSON.parse(raw || '{}'); } catch (e) { gids = {}; }
   if (gids[name] !== undefined) return gids[name];
   var meta = Sheets.Spreadsheets.get(dbId_(), { fields: 'sheets.properties' });
   gids = {};
@@ -670,8 +1110,13 @@ function gid_(name) {
     gids[name] = r.replies[0].addSheet.properties.sheetId;
     Sheets.Spreadsheets.Values.update({ values: [TABLES[name]] }, dbId_(), name + '!A1', { valueInputOption: 'RAW' });
   }
-  props.setProperty('DB_GIDS', JSON.stringify(gids));
+  props.setProperty(key, JSON.stringify(gids));
   return gids[name];
+}
+
+/** Per-project cache key for a table — projects must never share cache rows. */
+function tblKey_(name) {
+  return 'tbl_' + PROJ.id + '_' + name;
 }
 
 function tableRange_(name) {
@@ -682,7 +1127,7 @@ function tableRange_(name) {
 function readTable_(name, noCache) {
   var cache = CacheService.getScriptCache();
   if (!noCache) {
-    var hit = cache.get('tbl_' + name);
+    var hit = cache.get(tblKey_(name));
     if (hit) {
       try { return JSON.parse(hit); } catch (e) { /* refetch */ }
     }
@@ -701,13 +1146,13 @@ function readTable_(name, noCache) {
   }
   if (!noCache) {
     var s = JSON.stringify(rows);
-    if (s.length < 90000) cache.put('tbl_' + name, s, CACHE_TTL_SECONDS);
+    if (s.length < 90000) cache.put(tblKey_(name), s, CACHE_TTL_SECONDS);
   }
   return rows;
 }
 
 function invalidate_(name) {
-  CacheService.getScriptCache().remove('tbl_' + name);
+  CacheService.getScriptCache().remove(tblKey_(name));
 }
 
 function appendRow_(name, obj) {
@@ -805,7 +1250,7 @@ function markMessagesRead_(ids) {
  *  on first read; rows without an id column so admins can just type values. */
 function readOptions_() {
   var cache = CacheService.getScriptCache();
-  var hit = cache.get('tbl_options');
+  var hit = cache.get(tblKey_('options'));
   if (hit) {
     try { return JSON.parse(hit); } catch (e) { /* refetch */ }
   }
@@ -829,22 +1274,207 @@ function readOptions_() {
     if (!out[cat]) out[cat] = [];
     if (out[cat].indexOf(val) === -1) out[cat].push(val);
   });
-  cache.put('tbl_options', JSON.stringify(out), CACHE_TTL_SECONDS);
+  cache.put(tblKey_('options'), JSON.stringify(out), CACHE_TTL_SECONDS);
   return out;
 }
 
-function uploadsFolderId_() {
-  var props = PropertiesService.getScriptProperties();
-  var id = props.getProperty('UPLOADS_FOLDER_ID');
-  if (id) return id;
-  var folder = Drive.Files.create({ name: UPLOADS_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' });
-  props.setProperty('UPLOADS_FOLDER_ID', folder.id);
-  return folder.id;
+// ------------------------------------------------- workspace provisioning
+// Creates a Google Workspace account firstname@designthinking.lk in the /ICE
+// org unit via the Admin SDK Directory advanced service (AdminDirectory), then
+// emails the temporary password to the address the person signed in with.
+// Requires: the api project's owner is a Workspace super-admin, designthinking.lk
+// is a verified domain, and the /ICE org unit exists. Scopes: admin.directory.user
+// + script.send_mail (see appsscript.json). Always returns '' on any failure so a
+// registration is never blocked by provisioning problems.
+
+/** Reduce a name part to a bare email-handle token: lowercase, [a-z0-9] only. */
+function handlePart_(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-/** Run once from the IDE to authorize the (drive.file) scope and create the database. */
+function isDuplicateUserError_(err) {
+  var m = String((err && err.message) || err || '');
+  return /already exist|duplicate|entity.*exist|409/i.test(m);
+}
+
+/** 16-char password satisfying default Workspace complexity (letter+digit+symbol). */
+function randomPassword_() {
+  var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  var s = '';
+  for (var i = 0; i < 14; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+  return s + 'q7$';
+}
+
+/** Create the workshop account, trying firstname@ then firstname.lastname@ then
+ *  numbered variants on collision. Returns the created email, or '' on failure. */
+function provisionWorkspaceAccount_(first, last, notifyEmail) {
+  try {
+    if (typeof AdminDirectory === 'undefined') return '';
+    var f = handlePart_(first);
+    var l = handlePart_(last);
+    if (!f) return '';
+    var candidates = [f];
+    if (l) {
+      candidates.push(f + '.' + l);
+      for (var n = 2; n <= 20; n++) candidates.push(f + '.' + l + n);
+    } else {
+      for (var n2 = 2; n2 <= 20; n2++) candidates.push(f + n2);
+    }
+    var password = randomPassword_();
+    for (var i = 0; i < candidates.length; i++) {
+      var primaryEmail = candidates[i] + '@' + WORKSPACE_DOMAIN;
+      try {
+        AdminDirectory.Users.insert({
+          primaryEmail: primaryEmail,
+          name: { givenName: first || f, familyName: last || first || f },
+          password: password,
+          changePasswordAtNextLogin: true,
+          orgUnitPath: WORKSPACE_OU,
+        });
+        sendWorkspaceCreds_(notifyEmail, first || f, primaryEmail, password);
+        return primaryEmail;
+      } catch (err) {
+        if (isDuplicateUserError_(err)) continue; // handle taken — try the next one
+        throw err; // real error (auth/scope/domain) — abort, caught below
+      }
+    }
+    return '';
+  } catch (err) {
+    console.error('provisionWorkspaceAccount_ failed: ' + ((err && err.stack) || err));
+    return '';
+  }
+}
+
+/** Email the new workshop credentials to the address the person signed in with. */
+function sendWorkspaceCreds_(to, firstName, workEmail, password) {
+  if (!to) return;
+  try {
+    var ev = escapeHtmlA_(PROJ.name);
+    var html =
+      '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#0E0F11">' +
+      '<h2 style="color:#6100FF;margin:0 0 6px">Your ' + ev + ' chat account</h2>' +
+      '<p>Hi ' + escapeHtmlA_(firstName) + ',</p>' +
+      '<p>We’ve created a workshop Google account for you so you can message mentors and other participants in Google Chat during ' + ev + '.</p>' +
+      '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;border-collapse:collapse">' +
+      '<tr><td style="padding:8px 14px;background:#F4F1FB;border-radius:8px 8px 0 0;font-size:13px;color:#555">Sign in at <b>chat.google.com</b> with</td></tr>' +
+      '<tr><td style="padding:12px 14px;background:#F8F7FC;font-size:16px"><b>' + escapeHtmlA_(workEmail) + '</b></td></tr>' +
+      '<tr><td style="padding:12px 14px;background:#F4F1FB;border-radius:0 0 8px 8px;font-size:16px">Temporary password: <b>' + escapeHtmlA_(password) + '</b></td></tr>' +
+      '</table>' +
+      '<p style="font-size:14px;color:#555">You’ll be asked to set a new password on first sign-in. This account is just for workshop messaging — you keep using your own Google account on the ' + ev + ' site.</p>' +
+      '<p style="font-size:13px;color:#888;margin-top:22px">' + ev + ' · Augmented Human Lab</p>' +
+      '</div>';
+    MailApp.sendEmail({
+      to: to,
+      subject: 'Your ' + PROJ.name + ' workshop chat account',
+      htmlBody: html,
+      name: PROJ.name,
+    });
+  } catch (err) {
+    console.error('sendWorkspaceCreds_ failed: ' + ((err && err.stack) || err));
+  }
+}
+
+/** Returning person: they already have a @designthinking.lk account from an
+ *  earlier workshop — remind them it works here too, instead of minting a
+ *  duplicate. No password included; they keep their existing one. */
+function sendWorkspaceWelcomeBack_(to, firstName, workEmail) {
+  if (!to) return;
+  try {
+    var ev = escapeHtmlA_(PROJ.name);
+    var html =
+      '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#0E0F11">' +
+      '<h2 style="color:#6100FF;margin:0 0 6px">Welcome back to ' + ev + '</h2>' +
+      '<p>Hi ' + escapeHtmlA_(firstName) + ',</p>' +
+      '<p>Good news — the workshop chat account you got at a previous workshop works for ' + ev + ' too.</p>' +
+      '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;border-collapse:collapse">' +
+      '<tr><td style="padding:8px 14px;background:#F4F1FB;border-radius:8px 8px 0 0;font-size:13px;color:#555">Sign in at <b>chat.google.com</b> with</td></tr>' +
+      '<tr><td style="padding:12px 14px;background:#F8F7FC;border-radius:0 0 8px 8px;font-size:16px"><b>' + escapeHtmlA_(workEmail) + '</b></td></tr>' +
+      '</table>' +
+      '<p style="font-size:14px;color:#555">Use the password you set last time. Forgotten it? Reply to this email and the organizers will reset it for you.</p>' +
+      '<p style="font-size:13px;color:#888;margin-top:22px">' + ev + ' · Augmented Human Lab</p>' +
+      '</div>';
+    MailApp.sendEmail({
+      to: to,
+      subject: 'Your ' + PROJ.name + ' workshop chat account',
+      htmlBody: html,
+      name: PROJ.name,
+    });
+  } catch (err) {
+    console.error('sendWorkspaceWelcomeBack_ failed: ' + ((err && err.stack) || err));
+  }
+}
+
+function escapeHtmlA_(s) {
+  return String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function uploadsFolderId_() {
+  if (PROJ.uploadsFolderId) return PROJ.uploadsFolderId;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var fresh = getProject_(PROJ.id, true);
+    if (fresh && fresh.uploadsFolderId) { PROJ.uploadsFolderId = fresh.uploadsFolderId; return PROJ.uploadsFolderId; }
+    var folder = Drive.Files.create({ name: PROJ.name + ' Uploads', mimeType: 'application/vnd.google-apps.folder' });
+    updateRegistryRowUnlocked_('projects', PROJ.id, { uploadsFolderId: folder.id, updatedAt: new Date().toISOString() });
+    invalidateRegistry_('projects');
+    PROJ.uploadsFolderId = folder.id;
+    return PROJ.uploadsFolderId;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Run once from the IDE to authorize all scopes (drive.file, admin.directory.user,
+ *  send_mail), create the registry (migrating an existing single-project
+ *  deployment into it) and the default project's database. Re-run after adding
+ *  scopes so Google shows the consent screen for the new permissions. */
 function setup() {
+  console.log('Registry ready: https://docs.google.com/spreadsheets/d/' + registryId_());
+  PROJ = getProject_(DEFAULT_PROJECT, true);
+  if (!PROJ) throw new Error('Default project missing from registry: ' + DEFAULT_PROJECT);
   var id = dbId_();
   console.log('Database ready: https://docs.google.com/spreadsheets/d/' + id);
   console.log('Uploads folder id: ' + uploadsFolderId_());
+  console.log('Workspace check: ' + checkWorkspaceAccess());
+}
+
+/** One-shot, idempotent: backfill the registry's cross-project directory from
+ *  the default project's existing users tab. Run from the IDE after the
+ *  multi-project code first ships. Rows already in the directory are left
+ *  untouched so a re-run never clobbers newer data. */
+function migrateDirectoryFromUsers() {
+  registryId_();
+  PROJ = getProject_(DEFAULT_PROJECT, true);
+  if (!PROJ || !PROJ.dbId) throw new Error('No ' + DEFAULT_PROJECT + ' database to migrate from.');
+  var added = 0;
+  readTable_('users', true).forEach(function (u) {
+    if (!u.email || findDirectory_(u.email)) return;
+    upsertDirectory_(u.email, {
+      workEmail: u.workEmail || '',
+      name: u.name,
+      lastProjectId: PROJ.id,
+      profile: JSON.stringify(profileSnapshot_(u)),
+    });
+    added++;
+  });
+  console.log('Directory backfilled: ' + added + ' added, ' + readRegistry_('directory', true).length + ' total.');
+}
+
+/** Smoke-test the Admin SDK wiring without creating anyone. Reads one account in
+ *  the workshop domain — this validates super-admin directory access and that
+ *  designthinking.lk is a domain in this Workspace, using only the
+ *  admin.directory.user scope that Users.insert also needs (no extra scope). The
+ *  /ICE org unit is exercised for real at insert time (provisioning is guarded). */
+function checkWorkspaceAccess() {
+  try {
+    if (typeof AdminDirectory === 'undefined') return 'AdminDirectory advanced service is NOT enabled.';
+    var resp = AdminDirectory.Users.list({ customer: 'my_customer', domain: WORKSPACE_DOMAIN, maxResults: 1 });
+    var n = (resp && resp.users && resp.users.length) || 0;
+    return 'OK — ' + WORKSPACE_DOMAIN + ' reachable (' + n + ' account' + (n === 1 ? '' : 's') + ' visible); ready to mint accounts into ' + WORKSPACE_OU + '.';
+  } catch (err) {
+    return 'FAILED — ' + ((err && err.message) || err) + ' (check super-admin rights and that ' + WORKSPACE_DOMAIN + ' is a verified domain).';
+  }
 }

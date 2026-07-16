@@ -1,14 +1,33 @@
-# ICE2026 — Backend (Google Apps Script)
+# ICE — Backend (Google Apps Script)
 
 Two clasp-managed Apps Script web apps, deployed from sankha@ahlab.org:
 
 | Project | Executes as | Access | Purpose |
 |---|---|---|---|
 | `auth/` | User accessing | Anyone with Google account | Google sign-in broker — mints HMAC-signed tokens, redirects back to the site with `#icetoken=` |
-| `api/`  | Owner | Anyone (anonymous) | JSON API over a Google Sheet (users, teams, messages, announcements) + Drive image uploads |
+| `api/`  | Owner | Anyone (anonymous) | Multi-project JSON API over Google Sheets (users, teams, messages, announcements) + Drive image uploads |
 
 The two projects share an HMAC secret in `src/Secret.js` (git-ignored — copy
 `Secret.js.example`, generate with `openssl rand -hex 32`, keep both copies identical).
+
+## Multi-project storage
+
+A central **registry spreadsheet** (Script Property `REGISTRY_ID`, created
+lazily) indexes every project (workshop instance) and holds a cross-project
+people directory:
+
+- `projects` tab — one row per project: slug, name, tagline, siteUrl,
+  status (`active`/`test`/`archived`), registrationOpen, provisionAccounts,
+  and pointers to the project's own database spreadsheet + uploads folder
+  (both auto-created on first use).
+- `directory` tab — one row per person (keyed by the personal email they
+  sign in with): their minted `@designthinking.lk` account and a profile
+  snapshot. Returning registrants keep their existing account (no duplicate
+  mint) and get their form prefilled.
+
+Every API request carries `project: '<slug>'`; omitting it falls back to
+`ice2026`. Test projects set `provisionAccounts` off, so registering there
+never creates real Workspace accounts or sends credential emails.
 
 ## Workflows
 
@@ -23,4 +42,8 @@ CORS: the frontend POSTs with `Content-Type: text/plain` (a CORS "simple request
 which Apps Script answers with `Access-Control-Allow-Origin: *`. No preflight, no proxy.
 
 One-time setup after creating from scratch: run `setup()` in the api project's
-script editor to authorize scopes and create the database spreadsheet.
+script editor to authorize scopes, create the registry (seeding the default
+project from any pre-multi-project `DB_ID`) and the default project's
+database. After the multi-project code first ships over an existing
+deployment, also run `migrateDirectoryFromUsers()` once to backfill the
+directory from the existing users tab.

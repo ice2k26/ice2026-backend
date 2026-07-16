@@ -1,5 +1,5 @@
 /**
- * ICE2026 Auth — Google sign-in broker.
+ * ICE Auth — Google sign-in broker.
  *
  * Deployed as: execute as USER_ACCESSING, access ANYONE (Google sign-in required).
  * Google forces the visitor to sign in before this doGet runs, so
@@ -14,7 +14,10 @@
 var TOKEN_TTL_DAYS = 30;
 
 // Redirect allowlist — token is only ever handed to these origins.
+// ice2026.designthinking.lk stays until its redirect to the new canonical
+// host (ice.designthinking.lk) is live; drop it after cutover.
 var ALLOWED_REDIRECT_PREFIXES = [
+  'https://ice.designthinking.lk/',
   'https://ice2026.designthinking.lk/',
   'http://localhost:',
   'http://127.0.0.1:',
@@ -41,7 +44,7 @@ function doGet(e) {
   if (!isAllowedRedirect_(redirect)) {
     return renderMessage_(
       'Invalid redirect',
-      'This sign-in link points to an unrecognized site (' + escapeHtml_(redirect) + '). Please start again from the official ICE2026 website.'
+      'This sign-in link points to an unrecognized site (' + escapeHtml_(redirect) + '). Please start again from the official ICE workshop website.'
     );
   }
 
@@ -59,7 +62,7 @@ function doGet(e) {
     '<script>try{window.top.location.href=' + JSON.stringify(target) + ';}catch(e){}</script>' +
     '</body></html>'
   );
-  page.setTitle('ICE2026 — Signing in');
+  page.setTitle('ICE — Signing in');
   return page;
 }
 
