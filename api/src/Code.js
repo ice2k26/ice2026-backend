@@ -160,7 +160,7 @@ function isAdminEmail_(email) {
 // ------------------------------------------------------------------- actions
 
 var AUTH_REQUIRED = {
-  me: 1, register: 1, update_profile: 1, upload_image: 1, check_url: 1, check_email: 1,
+  me: 1, register: 1, update_profile: 1, upload_image: 1, check_url: 1, check_email: 1, persona: 1,
   create_team: 1, update_team: 1, delete_team: 1, join_team: 1, leave_team: 1,
   team_link_add: 1, team_link_delete: 1, team_post_add: 1,
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
@@ -223,6 +223,35 @@ var ACTIONS = {
       if (/not\s*found|404|does not exist|resource/i.test(m)) return { available: true, email: email };
       return { available: false, reason: 'error', message: m };
     }
+  },
+
+  /** Live persona blurb for the register/edit card, written by Claude from
+   *  whatever profile fields are filled so far. Needs the Script Property
+   *  ANTHROPIC_API_KEY; without it returns disabled:true and the frontend
+   *  keeps its static copy. Cached by content hash so a form that settles on
+   *  the same fields never re-bills. */
+  persona: function (params, ctx) {
+    var apiKey = getConfig_('ANTHROPIC_API_KEY', '');
+    if (!apiKey) return { text: '', disabled: true };
+    var fields = {
+      name: clean_(params.name, 100),
+      role: params.role === 'mentor' ? 'mentor (facilitator)' : 'participant',
+      affiliation: clean_(params.affiliation, 200),
+      expertise: clean_(params.expertise, 500),
+      bio: clean_(params.bio, 2000),
+      skills: parseArr_(params.skills).map(function (s) { return clean_(s, 40); }).slice(0, 10),
+    };
+    if (!fields.name && !fields.affiliation && !fields.expertise && !fields.bio && !fields.skills.length) {
+      return { text: '' };
+    }
+    var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify(fields));
+    var cacheKey = 'persona_' + Utilities.base64EncodeWebSafe(digest).slice(0, 40);
+    var cache = CacheService.getScriptCache();
+    var hit = cache.get(cacheKey);
+    if (hit !== null) return { text: hit };
+    var text = generatePersona_(apiKey, fields);
+    if (text) cache.put(cacheKey, text, 21600); // 6 h
+    return { text: text };
   },
 
   /** One-shot payload for the frontend: directory + teams + announcements. */
@@ -319,7 +348,9 @@ var ACTIONS = {
       gender: clean_(params.gender, 30),
       links: jsonArr_(params.links, 10, 300),
       video: clean_(params.video, 300),
-      role: isAdminEmail_(ctx.email) ? 'admin' : 'participant',
+      // Self-selected on the card: participant (member/student) or mentor
+      // (facilitator). Global admins always register as admin.
+      role: isAdminEmail_(ctx.email) ? 'admin' : (params.role === 'mentor' ? 'mentor' : 'participant'),
       createdAt: now,
       updatedAt: now,
       workEmail: workEmail,
@@ -350,6 +381,10 @@ var ACTIONS = {
     if (params.gender !== undefined) patch.gender = clean_(params.gender, 30);
     if (params.links !== undefined) patch.links = jsonArr_(params.links, 10, 300);
     if (params.video !== undefined) patch.video = clean_(params.video, 300);
+    // Role is self-editable between participant and mentor; admins keep admin.
+    if (params.role !== undefined && ['participant', 'mentor'].indexOf(params.role) !== -1 && ctx.user.role !== 'admin') {
+      patch.role = params.role;
+    }
     updateRowById_('users', ctx.user.id, patch);
     var updated = findUserByEmail_(ctx.email);
     // Keep the cross-project directory snapshot tracking their latest profile.
@@ -1276,6 +1311,50 @@ function readOptions_() {
   });
   cache.put(tblKey_('options'), JSON.stringify(out), CACHE_TTL_SECONDS);
   return out;
+}
+
+// ----------------------------------------------------------- persona (LLM)
+// Claude writes the short persona blurb shown beside the card while a person
+// fills in their profile. Raw Messages API over UrlFetchApp (no Apps Script
+// SDK exists). Key: Script Property ANTHROPIC_API_KEY. Swap PERSONA_MODEL to
+// 'claude-haiku-4-5' if per-keystroke cost ever matters more than quality.
+var PERSONA_MODEL = 'claude-opus-4-8';
+
+function generatePersona_(apiKey, fields) {
+  try {
+    var lines = [];
+    if (fields.name) lines.push('Name: ' + fields.name);
+    lines.push('Role at the workshop: ' + fields.role);
+    if (fields.affiliation) lines.push('Affiliation: ' + fields.affiliation);
+    if (fields.expertise) lines.push('Expertise: ' + fields.expertise);
+    if (fields.skills.length) lines.push('Skills: ' + fields.skills.join(', '));
+    if (fields.bio) lines.push('Bio: ' + fields.bio);
+    var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      payload: JSON.stringify({
+        model: PERSONA_MODEL,
+        max_tokens: 300,
+        system: 'You write short persona introductions for a design-thinking workshop\'s community platform. From the profile fields provided, write a warm, positive, third-person introduction of this person in 2-3 sentences (at most ~60 words). Celebrate what is there; never mention missing or empty fields, never invent facts. If the fields are very sparse, write one inviting sentence about who they seem to be so far. Respond with only the introduction text - no preamble, no quotes, no markdown.',
+        messages: [{ role: 'user', content: lines.join('\n') }],
+      }),
+    });
+    var code = resp.getResponseCode();
+    if (code < 200 || code >= 300) {
+      console.error('persona API HTTP ' + code + ': ' + resp.getContentText().slice(0, 300));
+      return '';
+    }
+    var data = JSON.parse(resp.getContentText());
+    if (data.stop_reason === 'refusal') return '';
+    var out = '';
+    (data.content || []).forEach(function (b) { if (b.type === 'text') out += b.text; });
+    return out.trim();
+  } catch (err) {
+    console.error('generatePersona_ failed: ' + ((err && err.stack) || err));
+    return '';
+  }
 }
 
 // ------------------------------------------------- workspace provisioning
