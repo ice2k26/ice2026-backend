@@ -112,6 +112,7 @@ function handle_(params) {
       ctx.email = email;
       ctx.user = PROJ ? findUserByEmail_(email) : null;
       ctx.isAdmin = isAdminEmail_(email) || (ctx.user && ctx.user.role === 'admin');
+      if (ctx.user) touchPresence_(ctx.user.id); // best-effort online marker
     }
 
     if (AUTH_REQUIRED[action] && !ctx.email) {
@@ -295,6 +296,7 @@ var ACTIONS = {
       users: users,
       teams: teams,
       announcements: announcements,
+      online: onlineIds_(),
       options: readOptions_(),
     };
   },
@@ -890,6 +892,36 @@ function getConfig_(key, fallback) {
 function safeParse_(s) {
   if (!s) return null;
   try { return JSON.parse(s); } catch (e) { return null; }
+}
+
+// ---------------------------------------------------------------- presence
+// Best-effort "online" tracking in CacheService — a per-project map of
+// userId → last-seen millis, touched on every authed request and read by
+// bootstrap. No sheet writes; ~5 minutes of silence counts as offline.
+var PRESENCE_TTL_MS = 5 * 60 * 1000;
+
+function touchPresence_(userId) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var key = 'online_' + PROJ.id;
+    var map = safeParse_(cache.get(key)) || {};
+    var now = Date.now();
+    map[userId] = now;
+    Object.keys(map).forEach(function (id) {
+      if (now - map[id] > 2 * PRESENCE_TTL_MS) delete map[id];
+    });
+    cache.put(key, JSON.stringify(map), 21600);
+  } catch (err) { /* presence is decorative */ }
+}
+
+function onlineIds_() {
+  try {
+    var map = safeParse_(CacheService.getScriptCache().get('online_' + PROJ.id)) || {};
+    var now = Date.now();
+    return Object.keys(map).filter(function (id) { return now - map[id] < PRESENCE_TTL_MS; });
+  } catch (err) {
+    return [];
+  }
 }
 
 function findUserByEmail_(email) {
