@@ -34,7 +34,7 @@ var PROJECT_SLUG_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
 // keyed by the personal email they sign in with — carries their minted
 // @designthinking.lk account and a profile snapshot across projects.
 var REGISTRY_TABS = {
-  projects: ['id', 'name', 'tagline', 'siteUrl', 'status', 'registrationOpen', 'provisionAccounts', 'dbId', 'uploadsFolderId', 'createdAt', 'updatedAt'],
+  projects: ['id', 'name', 'tagline', 'siteUrl', 'status', 'registrationOpen', 'provisionAccounts', 'dbId', 'uploadsFolderId', 'createdAt', 'updatedAt', 'startDate', 'endDate'],
   directory: ['email', 'workEmail', 'name', 'lastProjectId', 'profile', 'updatedAt'],
 };
 
@@ -769,6 +769,20 @@ var ACTIONS = {
     }
     if (params.registrationOpen !== undefined) patch.registrationOpen = truthy_(params.registrationOpen) ? 'true' : 'false';
     if (params.provisionAccounts !== undefined) patch.provisionAccounts = truthy_(params.provisionAccounts) ? 'true' : 'false';
+    var dateFields = ['startDate', 'endDate'];
+    for (var di = 0; di < dateFields.length; di++) {
+      var dk = dateFields[di];
+      if (params[dk] !== undefined) {
+        var dv = clean_(params[dk], 10);
+        if (dv && !/^\d{4}-\d{2}-\d{2}$/.test(dv)) {
+          return { ok: false, error: 'validation', message: 'Dates must be YYYY-MM-DD.' };
+        }
+        patch[dk] = dv;
+      }
+    }
+    if (patch.startDate && patch.endDate && patch.endDate < patch.startDate) {
+      return { ok: false, error: 'validation', message: 'End date is before the start date.' };
+    }
     updateRegistryRowByKey_('projects', PROJ.id, patch);
     PROJ = getProject_(PROJ.id, true);
     return { project: projectPublic_() };
@@ -814,6 +828,8 @@ function projectPublic_() {
     status: PROJ.status,
     registrationOpen: PROJ.registrationOpen,
     provisionAccounts: PROJ.provisionAccounts,
+    startDate: PROJ.startDate,
+    endDate: PROJ.endDate,
   };
 }
 
@@ -974,7 +990,7 @@ function registryId_() {
       'ice2026.designthinking.lk', 'active',
       getConfig_('REGISTRATION_OPEN', 'true'), 'true',
       props.getProperty('DB_ID') || '', props.getProperty('UPLOADS_FOLDER_ID') || '',
-      now, now,
+      now, now, '', '',
     ]] });
     Sheets.Spreadsheets.Values.batchUpdate({ valueInputOption: 'RAW', data: data }, ss.spreadsheetId);
     props.setProperty('REGISTRY_ID', ss.spreadsheetId);
@@ -1082,6 +1098,8 @@ function getProject_(slug, noCache) {
         provisionAccounts: truthy_(p.provisionAccounts),
         dbId: p.dbId,
         uploadsFolderId: p.uploadsFolderId,
+        startDate: p.startDate || '',
+        endDate: p.endDate || '',
       };
     }
   }
@@ -1550,6 +1568,20 @@ function setup() {
   console.log('Database ready: https://docs.google.com/spreadsheets/d/' + id);
   console.log('Uploads folder id: ' + uploadsFolderId_());
   console.log('Workspace check: ' + checkWorkspaceAccess());
+}
+
+/** Re-write the registry tabs' header rows — run from the IDE after
+ *  REGISTRY_TABS gains new columns (data alignment is unaffected because new
+ *  columns are always appended at the end). */
+function patchRegistryHeaders() {
+  var id = registryId_();
+  Sheets.Spreadsheets.Values.batchUpdate({
+    valueInputOption: 'RAW',
+    data: Object.keys(REGISTRY_TABS).map(function (name) {
+      return { range: name + '!A1', values: [REGISTRY_TABS[name]] };
+    }),
+  }, id);
+  console.log('Registry headers updated.');
 }
 
 /** One-shot, idempotent: backfill the registry's cross-project directory from
