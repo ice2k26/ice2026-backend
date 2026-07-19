@@ -78,6 +78,12 @@ var DEFAULT_OPTIONS = {
 // workEmail is public: it's a workshop chat handle other participants DM.
 var USER_PUBLIC_FIELDS = ['id', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'links', 'video', 'role', 'createdAt', 'workEmail'];
 
+// Fixed workshop teams for admin assignment ("Team A"…"Team F", rows created
+// in the teams tab on first use). Per team: 5 participants + 2 mentors — an
+// admin assigned to a team occupies a mentor slot.
+var TEAM_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
+var TEAM_CAP = { participant: 5, mentor: 2 };
+
 // ---------------------------------------------------------------- entrypoints
 
 function doGet(e) {
@@ -167,11 +173,13 @@ var AUTH_REQUIRED = {
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
   ann_create: 1, ann_update: 1, ann_delete: 1,
   admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
+  admin_assign_team: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
 var ADMIN_REQUIRED = {
   admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
+  admin_assign_team: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
@@ -711,6 +719,67 @@ var ACTIONS = {
     updateRowById_('users', u.id, { workEmail: workEmail, updatedAt: new Date().toISOString() });
     upsertDirectory_(u.email, { workEmail: workEmail, name: u.name, lastProjectId: PROJ.id });
     return { workEmail: workEmail };
+  },
+
+  // Put a user into one of the fixed teams (A–F), or pull them out with
+  // team: ''. The "Team X" row is created on first assignment. Capacity is
+  // enforced here (5 participants + 2 mentors per team); membership is
+  // exclusive — assigning removes the user from every other team first.
+  admin_assign_team: function (params, ctx) {
+    var user = rowById_('users', params.userId);
+    if (!user) return { ok: false, error: 'notfound', message: 'User not found.' };
+    var letter = clean_(params.team, 1).toUpperCase();
+    if (letter && TEAM_LETTERS.indexOf(letter) === -1) {
+      return { ok: false, error: 'validation', message: 'Team must be one of ' + TEAM_LETTERS.join(', ') + ' — or empty to unassign.' };
+    }
+    var now = new Date().toISOString();
+    var teams = readTable_('teams', true);
+    var target = null;
+    if (letter) {
+      var wanted = ('team ' + letter).toLowerCase();
+      teams.forEach(function (t) {
+        if (String(t.name || '').trim().toLowerCase() === wanted) target = t;
+      });
+      if (!target) {
+        target = {
+          id: Utilities.getUuid(), name: 'Team ' + letter, description: '', coverImage: '',
+          lookingFor: '', creatorId: ctx.user ? ctx.user.id : '', members: '[]',
+          createdAt: now, updatedAt: now,
+        };
+        appendRow_('teams', target);
+        teams.push(target);
+      }
+      // Count the target's current slots by role (the assignee excluded, so
+      // re-assigning someone already there can never trip the cap).
+      var byId = {};
+      readTable_('users').forEach(function (u) { byId[u.id] = u; });
+      var slot = function (u) { return u.role === 'participant' ? 'participant' : 'mentor'; };
+      var used = { participant: 0, mentor: 0 };
+      parseArr_(target.members).forEach(function (id) {
+        var m = byId[id];
+        if (m && m.id !== user.id) used[slot(m)]++;
+      });
+      var mySlot = slot(user);
+      if (used[mySlot] >= TEAM_CAP[mySlot]) {
+        return { ok: false, error: 'full', message: target.name + ' already has ' + TEAM_CAP[mySlot] + ' ' + mySlot + 's.' };
+      }
+    }
+    teams.forEach(function (t) {
+      var members = parseArr_(t.members);
+      var has = members.indexOf(user.id) !== -1;
+      if (target && t.id === target.id) {
+        if (!has) {
+          members.push(user.id);
+          updateRowById_('teams', t.id, { members: JSON.stringify(members), updatedAt: now });
+        }
+      } else if (has) {
+        updateRowById_('teams', t.id, {
+          members: JSON.stringify(members.filter(function (id) { return id !== user.id; })),
+          updatedAt: now,
+        });
+      }
+    });
+    return { teams: readTable_('teams', true).map(parseTeam_) };
   },
 
   // -------------------------------------------------- project management
