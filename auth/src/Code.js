@@ -52,18 +52,56 @@ function doGet(e) {
   var sep = redirect.indexOf('#') === -1 ? '#' : '&';
   var target = redirect + sep + 'icetoken=' + encodeURIComponent(token);
 
-  // HtmlService pages run in a sandboxed iframe; window.top navigation is
-  // permitted and replaces the whole tab with the frontend URL.
-  var page = HtmlService.createHtmlOutput(
-    '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Signing in…</title></head>' +
-    '<body style="font-family:sans-serif;padding:2rem;color:#0E0F11">' +
-    '<p>Signing you in as <b>' + escapeHtml_(email) + '</b>…</p>' +
-    '<p>If nothing happens, <a id="go" href="' + target.replace(/"/g, '&quot;') + '" target="_top">click here to continue</a>.</p>' +
-    '<script>try{window.top.location.href=' + JSON.stringify(target) + ';}catch(e){}</script>' +
-    '</body></html>'
-  );
+  // The sandboxed iframe blocks scripted top-level navigation, so a
+  // user-gesture link (target=_top) is the only reliable way back.
+  var page = HtmlService.createHtmlOutput(pageShell_(
+    'Signing in…',
+    '<h1>You&#39;re signed in</h1>' +
+    '<p class="body"><b>' + escapeHtml_(email) + '</b></p>' +
+    '<a class="btn" href="' + target.replace(/"/g, '&quot;') + '" target="_top">Continue</a>'
+  ));
   page.setTitle('ICE — Signing in');
   return page;
+}
+
+/**
+ * Shared page chrome mirroring the frontend theme (web/css/theme.css).
+ * The app's light/dark toggle lives in its own localStorage, unreachable
+ * from this Google-hosted origin — prefers-color-scheme is the proxy.
+ */
+function pageShell_(title, inner) {
+  return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>' + escapeHtml_(title) + '</title>' +
+    '<style>' +
+    ':root{--accent:#6100FF;--bg:#FFFFFF;--text:#0E0F11;--text-body:#5E6875;--text-muted:#838D95}' +
+    '@media(prefers-color-scheme:dark){:root{--accent:#00D7EE;--bg:#121316;--text:#F2F4F7;--text-body:#B7BEC8;--text-muted:#8A939D}}' +
+    'html,body{height:100%}' +
+    'body{margin:0;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);' +
+    'font-family:"neue-haas-grotesk-text","Helvetica Neue",-apple-system,"Segoe UI",sans-serif;' +
+    '-webkit-font-smoothing:antialiased;text-align:center}' +
+    'main{padding:24px;max-width:26rem}' +
+    '.mark{width:56px;height:56px;border-radius:14px;margin-bottom:20px}' +
+    'h1{font-family:"neue-haas-grotesk-display","Helvetica Neue",-apple-system,"Segoe UI",sans-serif;' +
+    'font-size:1.35rem;font-weight:600;letter-spacing:-0.01em;margin:0 0 6px}' +
+    'p{margin:0 0 8px;font-size:0.95rem;line-height:1.5}' +
+    '.body{color:var(--text-body)}.muted{color:var(--text-muted);font-size:0.85rem;margin-top:16px}' +
+    'a{color:var(--accent);text-decoration:none;font-weight:500}a:hover{text-decoration:underline}' +
+    '.btn{display:inline-flex;align-items:center;justify-content:center;margin-top:20px;' +
+    'padding:10px 28px;border-radius:999px;font-size:14.5px;font-weight:600;line-height:1.2;color:#fff;' +
+    'background:linear-gradient(90deg,#00D7EE 0%,#2E6BF6 55%,#6100FF 100%);' +
+    'box-shadow:0 4px 16px -4px rgba(97,0,255,0.45);transition:filter .15s,transform .1s}' +
+    '.btn:hover{filter:brightness(1.06);text-decoration:none}.btn:active{transform:translateY(1px)}' +
+    '</style></head><body><main>' +
+    '<svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-label="ICE">' +
+    '<defs><linearGradient id="g" x1="1" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="#00D7EE"/><stop offset="1" stop-color="#6100FF"/>' +
+    '</linearGradient></defs>' +
+    '<rect width="64" height="64" rx="16" fill="url(#g)"/>' +
+    '<text x="32" y="42" font-family="Helvetica, Arial, sans-serif" font-size="26" font-weight="800" fill="#fff" text-anchor="middle">ICE</text>' +
+    '</svg>' +
+    inner +
+    '</main></body></html>';
 }
 
 function isAllowedRedirect_(url) {
@@ -87,11 +125,10 @@ function b64url_(bytes) {
 }
 
 function renderMessage_(title, body) {
-  return HtmlService.createHtmlOutput(
-    '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + escapeHtml_(title) + '</title></head>' +
-    '<body style="font-family:sans-serif;padding:2rem;color:#0E0F11">' +
-    '<h2>' + escapeHtml_(title) + '</h2><p>' + body + '</p></body></html>'
-  );
+  return HtmlService.createHtmlOutput(pageShell_(
+    title,
+    '<h1>' + escapeHtml_(title) + '</h1><p class="body">' + body + '</p>'
+  ));
 }
 
 function escapeHtml_(s) {
