@@ -26,6 +26,7 @@
 var ADMIN_EMAILS = ['sankha@ahlab.org'];
 
 var DEFAULT_PROJECT = 'ice2026';
+var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 var REGISTRY_NAME = 'ICE Projects Registry';
 var PROJECT_SLUG_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
 
@@ -53,8 +54,12 @@ var WORKSPACE_DOMAIN = 'designthinking.lk';
 var WORKSPACE_OU = '/ICE';
 
 // workEmail = the minted @designthinking.lk address (blank until provisioned).
+// invites = the project's allowlist: register refuses emails without a row
+// here, and the row fixes the role. Rows outlive registration — "invited vs
+// registered" is derived by matching users.email.
 var TABLES = {
   users: ['id', 'email', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'gender', 'links', 'video', 'role', 'createdAt', 'updatedAt', 'workEmail'],
+  invites: ['id', 'email', 'role', 'invitedBy', 'createdAt', 'lastSentAt', 'sendCount'],
   teams: ['id', 'name', 'description', 'coverImage', 'lookingFor', 'creatorId', 'members', 'createdAt', 'updatedAt'],
   team_links: ['id', 'teamId', 'createdBy', 'title', 'url', 'description', 'createdAt'],
   team_posts: ['id', 'teamId', 'createdBy', 'content', 'createdAt'],
@@ -213,12 +218,14 @@ var AUTH_REQUIRED = {
   ann_create: 1, ann_update: 1, ann_delete: 1,
   admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
   admin_assign_team: 1,
+  admin_invite: 1, admin_resend_invite: 1, admin_revoke_invite: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
 var ADMIN_REQUIRED = {
   admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
   admin_assign_team: 1,
+  admin_invite: 1, admin_resend_invite: 1, admin_revoke_invite: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
@@ -328,9 +335,19 @@ var ACTIONS = {
       var dir = findDirectory_(ctx.email);
       if (dir) prefill = { workEmail: dir.workEmail || '', profile: safeParse_(dir.profile) };
     }
+    // Signed in but not registered: their invite (if any) tells the register
+    // card which role this email was pre-assigned. null = not invited.
+    var invite = null;
+    if (ctx.email && !ctx.user) {
+      var invRow = findInviteByEmail_(ctx.email);
+      if (invRow) invite = { role: invRow.role === 'mentor' ? 'mentor' : 'participant' };
+    }
     return {
       registrationOpen: PROJ.registrationOpen,
       me: ctx.user ? projectUser_(ctx.user, ctx, true) : null,
+      email: ctx.email || undefined,
+      invite: invite,
+      invites: ctx.isAdmin ? readInvites_() : undefined,
       isAdmin: !!ctx.isAdmin,
       project: projectPublic_(),
       projects: listVisibleProjects_(ctx),
@@ -426,6 +443,12 @@ var ACTIONS = {
     if (!PROJ.registrationOpen && !ctx.isAdmin) {
       return { ok: false, error: 'closed', message: 'Registration is closed.' };
     }
+    // Invitation gate: the invites tab is the allowlist, and the invite fixed
+    // the role — the card no longer asks. Global admins need no invite.
+    var invite = findInviteByEmail_(ctx.email);
+    if (!invite && !ctx.isAdmin) {
+      return { ok: false, error: 'notinvited', message: 'Registration is by invitation — ask an organizer to invite ' + ctx.email + '.' };
+    }
     var first = clean_(params.firstName, 50);
     var last = clean_(params.lastName, 50);
     var name = clean_(params.name, 100) || (first + ' ' + last).trim();
@@ -461,9 +484,9 @@ var ACTIONS = {
       gender: clean_(params.gender, 30),
       links: jsonArr_(params.links, 10, 300),
       video: clean_(params.video, 300),
-      // Self-selected on the card: participant (member/student) or mentor
+      // Pre-assigned by the invite: participant (member/student) or mentor
       // (facilitator). Global admins always register as admin.
-      role: isAdminEmail_(ctx.email) ? 'admin' : (params.role === 'mentor' ? 'mentor' : 'participant'),
+      role: isAdminEmail_(ctx.email) ? 'admin' : (invite && invite.role === 'mentor' ? 'mentor' : 'participant'),
       createdAt: now,
       updatedAt: now,
       workEmail: workEmail,
@@ -494,15 +517,8 @@ var ACTIONS = {
     if (params.gender !== undefined) patch.gender = clean_(params.gender, 30);
     if (params.links !== undefined) patch.links = jsonArr_(params.links, 10, 300);
     if (params.video !== undefined) patch.video = clean_(params.video, 300);
-    // The community role is self-editable between participant and mentor; an
-    // admin chip is preserved. People whose community role was removed can't
-    // grant themselves one here — that's admin-only (admin_add_role).
-    if (params.role !== undefined && ['participant', 'mentor'].indexOf(params.role) !== -1) {
-      var curRoles = rolesOf_(ctx.user);
-      if (curRoles.indexOf('participant') !== -1 || curRoles.indexOf('mentor') !== -1) {
-        patch.role = roleValue_(curRoles.filter(function (r) { return r === 'admin'; }).concat([params.role]));
-      }
-    }
+    // Roles are pre-assigned (invite) and admin-managed (admin_add_role /
+    // admin_remove_role) — update_profile never touches them.
     updateRowById_('users', ctx.user.id, patch);
     var updated = findUserByEmail_(ctx.email);
     // Keep the cross-project directory snapshot tracking their latest profile.
@@ -862,6 +878,70 @@ var ACTIONS = {
     return { workEmail: workEmail };
   },
 
+  // ---------------------------------------------------------------- invites
+  // Batch-invite emails as participant or mentor: upsert allowlist rows in the
+  // invites tab and email each address an onboarding invitation. Inviting an
+  // already-invited email updates its role and re-sends; already-registered
+  // emails are skipped and reported.
+  admin_invite: function (params, ctx) {
+    var role = String(params.role || '').toLowerCase();
+    if (role !== 'participant' && role !== 'mentor') {
+      return { ok: false, error: 'validation', message: 'Invite role must be participant or mentor.' };
+    }
+    var raw = Array.isArray(params.emails) ? params.emails : parseArr_(params.emails);
+    var emails = [];
+    raw.forEach(function (e) {
+      e = clean_(e, 120).toLowerCase();
+      if (EMAIL_RE.test(e) && emails.indexOf(e) === -1) emails.push(e);
+    });
+    if (!emails.length) return { ok: false, error: 'validation', message: 'No valid email addresses.' };
+    if (emails.length > 50) return { ok: false, error: 'validation', message: 'At most 50 invitations at a time.' };
+    var byEmail = {};
+    readInvites_(true).forEach(function (i) { byEmail[String(i.email).toLowerCase()] = i; });
+    var now = new Date().toISOString();
+    var sent = [], alreadyRegistered = [], failed = [];
+    emails.forEach(function (email) {
+      if (findUserByEmail_(email)) { alreadyRegistered.push(email); return; }
+      var mailed = sendInviteEmail_(email, role);
+      var existing = byEmail[email];
+      if (existing) {
+        updateRowById_('invites', existing.id, {
+          role: role,
+          lastSentAt: mailed ? now : existing.lastSentAt,
+          sendCount: String((Number(existing.sendCount) || 0) + (mailed ? 1 : 0)),
+        });
+      } else {
+        appendRow_('invites', {
+          id: Utilities.getUuid(), email: email, role: role, invitedBy: ctx.email,
+          createdAt: now, lastSentAt: mailed ? now : '', sendCount: mailed ? '1' : '0',
+        });
+      }
+      (mailed ? sent : failed).push(email);
+    });
+    return { sent: sent, alreadyRegistered: alreadyRegistered, failed: failed, invites: readInvites_(true) };
+  },
+
+  admin_resend_invite: function (params, ctx) {
+    var inv = rowById_('invites', params.inviteId);
+    if (!inv) return { ok: false, error: 'notfound', message: 'Invite not found.' };
+    if (!sendInviteEmail_(inv.email, inv.role)) {
+      return { ok: false, error: 'mail', message: 'Could not send the email — check the execution logs and the daily mail quota.' };
+    }
+    updateRowById_('invites', inv.id, {
+      lastSentAt: new Date().toISOString(),
+      sendCount: String((Number(inv.sendCount) || 0) + 1),
+    });
+    return { invite: rowById_('invites', inv.id) };
+  },
+
+  // Dropping the row closes the allowlist door again; a registered user's row
+  // being revoked has no effect on their account.
+  admin_revoke_invite: function (params, ctx) {
+    var inv = rowById_('invites', params.inviteId);
+    if (inv) deleteRowById_('invites', inv.id);
+    return {};
+  },
+
   // Put a user into one of the fixed teams (A–F), or pull them out with
   // team: ''. The "Team X" row is created on first assignment. Capacity is
   // enforced here (5 participants + 2 mentors per team); membership is
@@ -1158,6 +1238,23 @@ function findUserByEmail_(email) {
   var users = readTable_('users');
   for (var i = 0; i < users.length; i++) {
     if (String(users[i].email).toLowerCase() === email) return users[i];
+  }
+  return null;
+}
+
+/** The invites tab, created lazily — project databases predating the invite
+ *  feature don't have it, and readTable_ throws on a missing tab. */
+function readInvites_(noCache) {
+  gid_('invites');
+  return readTable_('invites', noCache);
+}
+
+function findInviteByEmail_(email) {
+  var key = String(email || '').toLowerCase();
+  if (!key) return null;
+  var rows = readInvites_();
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i].email).toLowerCase() === key) return rows[i];
   }
   return null;
 }
@@ -1746,6 +1843,43 @@ function sendWorkspaceCreds_(to, firstName, workEmail, password) {
     });
   } catch (err) {
     console.error('sendWorkspaceCreds_ failed: ' + ((err && err.stack) || err));
+  }
+}
+
+/** Onboarding invitation: sign in with THIS email on the workshop site, then
+ *  complete the profile card. Returns false when the send fails (quota etc.)
+ *  so the caller can report it — the allowlist row is written regardless. */
+function sendInviteEmail_(to, role) {
+  try {
+    var ev = escapeHtmlA_(PROJ.name);
+    var url = PROJ.siteUrl
+      ? (/^https?:\/\//i.test(PROJ.siteUrl) ? PROJ.siteUrl : 'https://' + PROJ.siteUrl)
+      : 'https://ice.designthinking.lk/?project=' + PROJ.id;
+    var roleLabel = role === 'mentor' ? 'a mentor' : 'a participant';
+    var html =
+      '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#0E0F11">' +
+      '<h2 style="color:#6100FF;margin:0 0 6px">You&#39;re invited to ' + ev + '</h2>' +
+      '<p>Hello,</p>' +
+      '<p>The organizers have invited you to join <b>' + ev + '</b> as <b>' + roleLabel + '</b>. Complete your registration to meet the other ' +
+      (role === 'mentor' ? 'mentors and participants' : 'participants and mentors') + ' and get started.</p>' +
+      '<ol style="font-size:14.5px;line-height:1.7;padding-left:20px;margin:16px 0">' +
+      '<li>Open the workshop site.</li>' +
+      '<li>Sign in with Google using <b>this email address</b> (' + escapeHtmlA_(to) + ') — only invited addresses can register.</li>' +
+      '<li>Fill in your profile card and join.</li>' +
+      '</ol>' +
+      '<p style="margin:22px 0"><a href="' + escapeHtmlA_(url) + '" style="display:inline-block;padding:12px 30px;border-radius:999px;font-size:14.5px;font-weight:600;color:#ffffff;text-decoration:none;background:#6100FF">Join ' + ev + '</a></p>' +
+      '<p style="font-size:13px;color:#888;margin-top:22px">' + ev + ' · Augmented Human Lab</p>' +
+      '</div>';
+    MailApp.sendEmail({
+      to: to,
+      subject: 'You’re invited to ' + PROJ.name,
+      htmlBody: html,
+      name: PROJ.name,
+    });
+    return true;
+  } catch (err) {
+    console.error('sendInviteEmail_ failed: ' + ((err && err.stack) || err));
+    return false;
   }
 }
 
