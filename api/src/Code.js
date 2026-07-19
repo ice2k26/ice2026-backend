@@ -117,7 +117,7 @@ function handle_(params) {
     if (email) {
       ctx.email = email;
       ctx.user = PROJ ? findUserByEmail_(email) : null;
-      ctx.isAdmin = isAdminEmail_(email) || (ctx.user && ctx.user.role === 'admin');
+      ctx.isAdmin = isAdminEmail_(email) || (ctx.user && hasRole_(ctx.user, 'admin'));
       if (ctx.user) touchPresence_(ctx.user.id); // best-effort online marker
     }
 
@@ -126,6 +126,14 @@ function handle_(params) {
     }
     if (ADMIN_REQUIRED[action] && !ctx.isAdmin) {
       return json_({ ok: false, error: 'forbidden', message: 'Admins only.' });
+    }
+    // Every role removed → visitor-level access only ('me' stays open so the
+    // frontend can explain). The row keeps all its data; an admin re-adding a
+    // role restores everything. Global admins (ADMIN_EMAILS) can't lock
+    // themselves out this way.
+    if (ctx.user && !ctx.isAdmin && AUTH_REQUIRED[action] && action !== 'me' &&
+        rolesOf_(ctx.user).length === 0) {
+      return json_({ ok: false, error: 'norole', message: 'Your account has no assigned role. Contact an organizer to restore access.' });
     }
 
     var result = fn(params, ctx);
@@ -164,6 +172,37 @@ function isAdminEmail_(email) {
   return ADMIN_EMAILS.indexOf(String(email).toLowerCase()) !== -1;
 }
 
+// -------------------------------------------------------------------- roles
+// users.role holds up to MAX_ROLES comma-separated roles: 'admin' plus one of
+// 'participant'/'mentor' (those two never coexist). 'none' = every role was
+// removed — the row and all data stay, but the person is treated like a
+// visitor until an admin assigns a role again. A blank/unknown value counts
+// as participant (the historical default). Mirrored by rolesOf() in web/js/app.js.
+
+var PLATFORM_ROLES = ['admin', 'participant', 'mentor'];
+var MAX_ROLES = 2;
+
+function rolesOf_(u) {
+  if (!u) return [];
+  var raw = String(u.role || '').trim().toLowerCase();
+  if (raw === 'none') return [];
+  if (!raw) return ['participant'];
+  var out = [];
+  raw.split(',').forEach(function (r) {
+    r = r.trim();
+    if (PLATFORM_ROLES.indexOf(r) !== -1 && out.indexOf(r) === -1) out.push(r);
+  });
+  return out.length ? out : ['participant'];
+}
+
+function hasRole_(u, role) { return rolesOf_(u).indexOf(role) !== -1; }
+
+/** The sheet-cell value for a role list — 'admin' first, empty list → 'none'. */
+function roleValue_(roles) {
+  var ordered = PLATFORM_ROLES.filter(function (r) { return roles.indexOf(r) !== -1; });
+  return ordered.length ? ordered.join(',') : 'none';
+}
+
 // ------------------------------------------------------------------- actions
 
 var AUTH_REQUIRED = {
@@ -172,20 +211,20 @@ var AUTH_REQUIRED = {
   team_link_add: 1, team_link_delete: 1, team_post_add: 1,
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
   ann_create: 1, ann_update: 1, ann_delete: 1,
-  admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
+  admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
   admin_assign_team: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
 var ADMIN_REQUIRED = {
-  admin_set_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
+  admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
   admin_assign_team: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
 
 // Mentors and admins may post announcements; edit/delete is author-or-admin.
 function canAnnounce_(ctx) {
-  return !!(ctx.isAdmin || (ctx.user && ctx.user.role === 'mentor'));
+  return !!(ctx.isAdmin || (ctx.user && hasRole_(ctx.user, 'mentor')));
 }
 
 var ACTIONS = {
@@ -309,6 +348,70 @@ var ACTIONS = {
     };
   },
 
+  /** Public workshop program: events from a Google Calendar between the
+   *  project's startDate/endDate (3-day window fallback). Configure with the
+   *  Script Property PROGRAM_CALENDAR_ID (or PROGRAM_CALENDAR_ID_<projectId>
+   *  per project) — AND add https://www.googleapis.com/auth/calendar.readonly
+   *  to appsscript.json's oauthScopes, then run setup() once in the IDE to
+   *  grant it, then redeploy. Until then this returns configured:false and
+   *  the frontend keeps its skeleton grid. Cached 5 minutes. */
+  program: function (params, ctx) {
+    var calId = getConfig_('PROGRAM_CALENDAR_ID_' + PROJ.id, '') || getConfig_('PROGRAM_CALENDAR_ID', '');
+    if (!calId) return { configured: false, events: [] };
+    var cache = CacheService.getScriptCache();
+    var key = 'program_' + PROJ.id;
+    var hit = cache.get(key);
+    if (hit) { try { return JSON.parse(hit); } catch (e) { /* refetch */ } }
+    var start = PROJ.startDate ? new Date(PROJ.startDate + 'T00:00:00') : new Date();
+    if (!PROJ.startDate) start.setHours(0, 0, 0, 0);
+    var end = PROJ.endDate ? new Date(PROJ.endDate + 'T23:59:59') : new Date(start.getTime() + 3 * 864e5);
+    var out;
+    try {
+      var cal = CalendarApp.getCalendarById(calId);
+      if (!cal) return { configured: false, events: [], message: 'Calendar not accessible: ' + calId };
+      // Wall-clock times in the CALENDAR's timezone — the agenda must render
+      // identically for every viewer, wherever they open it from.
+      var tz = cal.getTimeZone() || Session.getScriptTimeZone();
+      var fmt = function (d) { return Utilities.formatDate(d, tz, "yyyy-MM-dd'T'HH:mm:ss"); };
+      out = {
+        configured: true,
+        timeZone: tz,
+        events: cal.getEvents(start, end).map(function (ev) {
+          return {
+            title: ev.getTitle(),
+            start: ev.getStartTime().toISOString(),
+            end: ev.getEndTime().toISOString(),
+            startLocal: fmt(ev.getStartTime()),
+            endLocal: fmt(ev.getEndTime()),
+            location: ev.getLocation() || '',
+            allDay: ev.isAllDayEvent(),
+          };
+        }),
+      };
+    } catch (err) {
+      // scope not yet granted or bad id — frontend keeps the skeleton
+      return { configured: false, events: [], message: String((err && err.message) || err) };
+    }
+    cache.put(key, JSON.stringify(out), 300);
+    return out;
+  },
+
+  /** Short Claude-written description of a skill, for the Skills map's side
+   *  panel. Public; cached 6 h per skill so each is billed at most ~4×/day. */
+  skill_info: function (params, ctx) {
+    var skill = clean_(params.skill, 40);
+    if (!skill) return { ok: false, error: 'validation', message: 'Skill required.' };
+    var apiKey = getConfig_('ANTHROPIC_API_KEY', '');
+    if (!apiKey) return { text: '', disabled: true };
+    var key = 'skilldesc_' + skill.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 60);
+    var cache = CacheService.getScriptCache();
+    var hit = cache.get(key);
+    if (hit !== null) return { text: hit };
+    var text = generateSkillBlurb_(apiKey, skill);
+    if (text) cache.put(key, text, 21600);
+    return { text: text };
+  },
+
   me: function (params, ctx) {
     return {
       registered: !!ctx.user,
@@ -391,9 +494,14 @@ var ACTIONS = {
     if (params.gender !== undefined) patch.gender = clean_(params.gender, 30);
     if (params.links !== undefined) patch.links = jsonArr_(params.links, 10, 300);
     if (params.video !== undefined) patch.video = clean_(params.video, 300);
-    // Role is self-editable between participant and mentor; admins keep admin.
-    if (params.role !== undefined && ['participant', 'mentor'].indexOf(params.role) !== -1 && ctx.user.role !== 'admin') {
-      patch.role = params.role;
+    // The community role is self-editable between participant and mentor; an
+    // admin chip is preserved. People whose community role was removed can't
+    // grant themselves one here — that's admin-only (admin_add_role).
+    if (params.role !== undefined && ['participant', 'mentor'].indexOf(params.role) !== -1) {
+      var curRoles = rolesOf_(ctx.user);
+      if (curRoles.indexOf('participant') !== -1 || curRoles.indexOf('mentor') !== -1) {
+        patch.role = roleValue_(curRoles.filter(function (r) { return r === 'admin'; }).concat([params.role]));
+      }
     }
     updateRowById_('users', ctx.user.id, patch);
     var updated = findUserByEmail_(ctx.email);
@@ -657,15 +765,48 @@ var ACTIONS = {
 
   // ------------------------------------------------------------------ admin
 
-  admin_set_role: function (params, ctx) {
+  // Role chips: a person holds up to 2 roles — 'admin' plus one of
+  // participant/mentor. Removing the last role parks the row as 'none'
+  // (visitor-level access, nothing deleted; re-adding a role restores all).
+  admin_add_role: function (params, ctx) {
     var user = rowById_('users', params.userId);
     if (!user) return { ok: false, error: 'notfound', message: 'User not found.' };
-    var role = String(params.role || '');
-    if (['participant', 'mentor', 'admin'].indexOf(role) === -1) {
+    var role = String(params.role || '').toLowerCase();
+    if (PLATFORM_ROLES.indexOf(role) === -1) {
       return { ok: false, error: 'validation', message: 'Role must be participant, mentor or admin.' };
     }
-    updateRowById_('users', user.id, { role: role, updatedAt: new Date().toISOString() });
-    return {};
+    var roles = rolesOf_(user);
+    if (roles.indexOf(role) !== -1) {
+      return { ok: false, error: 'validation', message: user.name + ' already has the ' + role + ' role.' };
+    }
+    if (roles.length >= MAX_ROLES) {
+      return { ok: false, error: 'validation', message: 'At most ' + MAX_ROLES + ' roles per person.' };
+    }
+    if (role !== 'admin' && (roles.indexOf('participant') !== -1 || roles.indexOf('mentor') !== -1)) {
+      return { ok: false, error: 'validation', message: 'Participant and mentor never coexist — remove the current one first.' };
+    }
+    updateRowById_('users', user.id, { role: roleValue_(roles.concat([role])), updatedAt: new Date().toISOString() });
+    return { roles: rolesOf_(rowById_('users', user.id)) };
+  },
+
+  admin_remove_role: function (params, ctx) {
+    var user = rowById_('users', params.userId);
+    if (!user) return { ok: false, error: 'notfound', message: 'User not found.' };
+    var role = String(params.role || '').toLowerCase();
+    var roles = rolesOf_(user);
+    if (roles.indexOf(role) === -1) {
+      return { ok: false, error: 'validation', message: user.name + ' does not have the ' + role + ' role.' };
+    }
+    // Any admin may strip another admin's chip, but never their own — that
+    // would break their session mid-flight.
+    if (role === 'admin' && ctx.user && ctx.user.id === user.id) {
+      return { ok: false, error: 'forbidden', message: 'You cannot remove your own admin role.' };
+    }
+    updateRowById_('users', user.id, {
+      role: roleValue_(roles.filter(function (r) { return r !== role; })),
+      updatedAt: new Date().toISOString(),
+    });
+    return { roles: rolesOf_(rowById_('users', user.id)) };
   },
 
   admin_delete_user: function (params, ctx) {
@@ -732,6 +873,9 @@ var ACTIONS = {
     if (letter && TEAM_LETTERS.indexOf(letter) === -1) {
       return { ok: false, error: 'validation', message: 'Team must be one of ' + TEAM_LETTERS.join(', ') + ' — or empty to unassign.' };
     }
+    if (letter && rolesOf_(user).length === 0) {
+      return { ok: false, error: 'validation', message: user.name + ' has no assigned role — add one before placing them in a team.' };
+    }
     var now = new Date().toISOString();
     var teams = readTable_('teams', true);
     var target = null;
@@ -753,7 +897,8 @@ var ACTIONS = {
       // re-assigning someone already there can never trip the cap).
       var byId = {};
       readTable_('users').forEach(function (u) { byId[u.id] = u; });
-      var slot = function (u) { return u.role === 'participant' ? 'participant' : 'mentor'; };
+      // participant chip → participant slot; mentor (or admin-only) → mentor slot
+      var slot = function (u) { return hasRole_(u, 'participant') ? 'participant' : 'mentor'; };
       var used = { participant: 0, mentor: 0 };
       parseArr_(target.members).forEach(function (id) {
         var m = byId[id];
@@ -1438,6 +1583,38 @@ function readOptions_() {
 // SDK exists). Key: Script Property ANTHROPIC_API_KEY. Swap PERSONA_MODEL to
 // 'claude-haiku-4-5' if per-keystroke cost ever matters more than quality.
 var PERSONA_MODEL = 'claude-opus-4-8';
+// Skill blurbs are tiny and cached hard — haiku is plenty.
+var SKILL_MODEL = 'claude-haiku-4-5';
+
+function generateSkillBlurb_(apiKey, skill) {
+  try {
+    var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      payload: JSON.stringify({
+        model: SKILL_MODEL,
+        max_tokens: 130,
+        system: 'You explain skills to participants of a design-thinking innovation workshop. In one or two plain, friendly sentences (at most ~35 words), say what the given skill is and why it helps when building a project. Respond with only the description — no preamble, no quotes, no markdown.',
+        messages: [{ role: 'user', content: 'Skill: ' + skill }],
+      }),
+    });
+    var code = resp.getResponseCode();
+    if (code < 200 || code >= 300) {
+      console.error('skill blurb HTTP ' + code + ': ' + resp.getContentText().slice(0, 300));
+      return '';
+    }
+    var data = JSON.parse(resp.getContentText());
+    if (data.stop_reason === 'refusal') return '';
+    var out = '';
+    (data.content || []).forEach(function (b) { if (b.type === 'text') out += b.text; });
+    return out.trim();
+  } catch (err) {
+    console.error('generateSkillBlurb_ failed: ' + ((err && err.stack) || err));
+    return '';
+  }
+}
 
 function generatePersona_(apiKey, fields) {
   try {
