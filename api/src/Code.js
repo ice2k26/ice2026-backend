@@ -902,7 +902,7 @@ var ACTIONS = {
     var sent = [], alreadyRegistered = [], failed = [];
     emails.forEach(function (email) {
       if (findUserByEmail_(email)) { alreadyRegistered.push(email); return; }
-      var mailed = sendInviteEmail_(email, role);
+      var mailed = sendInviteEmail_(email, role, ctx.email);
       var existing = byEmail[email];
       if (existing) {
         updateRowById_('invites', existing.id, {
@@ -924,7 +924,7 @@ var ACTIONS = {
   admin_resend_invite: function (params, ctx) {
     var inv = rowById_('invites', params.inviteId);
     if (!inv) return { ok: false, error: 'notfound', message: 'Invite not found.' };
-    if (!sendInviteEmail_(inv.email, inv.role)) {
+    if (!sendInviteEmail_(inv.email, inv.role, ctx.email)) {
       return { ok: false, error: 'mail', message: 'Could not send the email — check the execution logs and the daily mail quota.' };
     }
     updateRowById_('invites', inv.id, {
@@ -1848,8 +1848,11 @@ function sendWorkspaceCreds_(to, firstName, workEmail, password) {
 
 /** Onboarding invitation: sign in with THIS email on the workshop site, then
  *  complete the profile card. Returns false when the send fails (quota etc.)
- *  so the caller can report it — the allowlist row is written regardless. */
-function sendInviteEmail_(to, role) {
+ *  so the caller can report it — the allowlist row is written regardless.
+ *  Deliverability: a plain-text body ships alongside the HTML and the link is
+ *  also visible as text (HTML-only, button-only mail scores high on spam
+ *  filters); replies go to the organizer who sent the invite. */
+function sendInviteEmail_(to, role, replyTo) {
   try {
     var ev = escapeHtmlA_(PROJ.name);
     var url = PROJ.siteUrl
@@ -1867,15 +1870,26 @@ function sendInviteEmail_(to, role) {
       '<li>Sign in with Google using <b>this email address</b> (' + escapeHtmlA_(to) + ') — only invited addresses can register.</li>' +
       '<li>Fill in your profile card and join.</li>' +
       '</ol>' +
-      '<p style="margin:22px 0"><a href="' + escapeHtmlA_(url) + '" style="display:inline-block;padding:12px 30px;border-radius:999px;font-size:14.5px;font-weight:600;color:#ffffff;text-decoration:none;background:#6100FF">Join ' + ev + '</a></p>' +
+      '<p style="margin:22px 0 8px"><a href="' + escapeHtmlA_(url) + '" style="display:inline-block;padding:12px 30px;border-radius:999px;font-size:14.5px;font-weight:600;color:#ffffff;text-decoration:none;background:#6100FF">Join ' + ev + '</a></p>' +
+      '<p style="font-size:13px;color:#555;margin:0 0 8px">Or open this link: <a href="' + escapeHtmlA_(url) + '">' + escapeHtmlA_(url) + '</a></p>' +
       '<p style="font-size:13px;color:#888;margin-top:22px">' + ev + ' · Augmented Human Lab</p>' +
       '</div>';
-    MailApp.sendEmail({
+    var text =
+      'You’re invited to ' + PROJ.name + '\n\n' +
+      'The organizers have invited you to join ' + PROJ.name + ' as ' + roleLabel + '.\n\n' +
+      '1. Open the workshop site: ' + url + '\n' +
+      '2. Sign in with Google using this email address (' + to + ') — only invited addresses can register.\n' +
+      '3. Fill in your profile card and join.\n\n' +
+      PROJ.name + ' · Augmented Human Lab';
+    var msg = {
       to: to,
       subject: 'You’re invited to ' + PROJ.name,
+      body: text,
       htmlBody: html,
       name: PROJ.name,
-    });
+    };
+    if (replyTo && EMAIL_RE.test(replyTo)) msg.replyTo = replyTo;
+    MailApp.sendEmail(msg);
     return true;
   } catch (err) {
     console.error('sendInviteEmail_ failed: ' + ((err && err.stack) || err));
