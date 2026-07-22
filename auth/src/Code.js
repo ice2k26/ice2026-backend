@@ -8,7 +8,11 @@
  * frontend with it in the URL hash. The API project (separate deployment,
  * executes as owner) verifies the same HMAC using the shared SECRET.
  *
- * SECRET lives in Secret.js (git-ignored, clasp-pushed). Same file in api/.
+ * SECRET lives in Script Properties (key "SECRET"), NOT in source: because
+ * this web app executes as USER_ACCESSING, the script file must be shared
+ * read-only with every visitor ("anyone with link — viewer"), so anything
+ * in source is world-readable. Script properties are not visible to viewers.
+ * The api/ project keeps the same value in its git-ignored Secret.js.
  */
 
 var TOKEN_TTL_DAYS = 30;
@@ -52,13 +56,25 @@ function doGet(e) {
   var sep = redirect.indexOf('#') === -1 ? '#' : '&';
   var target = redirect + sep + 'icetoken=' + encodeURIComponent(token);
 
+  // "Use a different account" — Apps Script has no in-page account picker;
+  // Session identity follows the browser's active Google session. Bounce
+  // through Google's AccountChooser, which shows every account signed in on
+  // this browser and continues back to this exec URL (re-running doGet as the
+  // chosen account). continue= must stay on a Google-owned host, which the
+  // script.google.com exec URL satisfies.
+  var self = ScriptApp.getService().getUrl() +
+    '?redirect=' + encodeURIComponent(redirect);
+  var switchUrl = 'https://accounts.google.com/AccountChooser?continue=' +
+    encodeURIComponent(self);
+
   // The sandboxed iframe blocks scripted top-level navigation, so a
   // user-gesture link (target=_top) is the only reliable way back.
   var page = HtmlService.createHtmlOutput(pageShell_(
     'Signing in…',
     '<h1>You&#39;re signed in</h1>' +
     '<p class="body"><b>' + escapeHtml_(email) + '</b></p>' +
-    '<a class="btn" href="' + target.replace(/"/g, '&quot;') + '" target="_top">Continue</a>'
+    '<a class="btn" href="' + target.replace(/"/g, '&quot;') + '" target="_top">Continue</a>' +
+    '<p class="muted"><a href="' + switchUrl.replace(/"/g, '&quot;') + '" target="_top">Use a different account</a></p>'
   ));
   page.setTitle('ICE — Signing in');
   return page;
@@ -114,9 +130,11 @@ function isAllowedRedirect_(url) {
 
 /** token = base64url("email|expiryMillis") + "." + base64url(hmac) */
 function mintToken_(email) {
+  var secret = PropertiesService.getScriptProperties().getProperty('SECRET');
+  if (!secret) throw new Error('SECRET script property is not set');
   var expiry = Date.now() + TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000;
   var payload = email + '|' + expiry;
-  var sig = Utilities.computeHmacSha256Signature(payload, SECRET);
+  var sig = Utilities.computeHmacSha256Signature(payload, secret);
   return b64url_(Utilities.newBlob(payload).getBytes()) + '.' + b64url_(sig);
 }
 

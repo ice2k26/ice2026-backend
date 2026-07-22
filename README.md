@@ -7,8 +7,18 @@ Two clasp-managed Apps Script web apps, deployed from sankha@ahlab.org:
 | `auth/` | User accessing | Anyone with Google account | Google sign-in broker — mints HMAC-signed tokens, redirects back to the site with `#icetoken=` |
 | `api/`  | Owner | Anyone (anonymous) | Multi-project JSON API over Google Sheets (users, teams, messages, announcements) + Drive image uploads |
 
-The two projects share an HMAC secret in `src/Secret.js` (git-ignored — copy
-`Secret.js.example`, generate with `openssl rand -hex 32`, keep both copies identical).
+The two projects share an HMAC secret (generate with `openssl rand -hex 32`):
+in `api/` it lives in `src/Secret.js` (git-ignored — copy `Secret.js.example`);
+in `auth/` it lives in a **Script Property** named `SECRET`, never in source.
+
+**Why the split, and why `auth/` must be shared:** the auth web app executes
+as *user accessing*, and Apps Script only lets a visitor run such a web app
+if they have at least **view access to the script file itself** — otherwise
+they get "Sorry, unable to open the file at present". The auth script is
+therefore shared "anyone with the link — viewer", which makes its source
+world-readable; the secret sits in Script Properties, which viewers can't
+read. (The api project executes as owner, needs no sharing, so its
+`Secret.js` stays private.)
 
 ## Multi-project storage
 
