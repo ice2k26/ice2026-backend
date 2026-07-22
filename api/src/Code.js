@@ -60,11 +60,15 @@ var WORKSPACE_OU = '/ICE';
 var TABLES = {
   users: ['id', 'email', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'gender', 'links', 'video', 'role', 'createdAt', 'updatedAt', 'workEmail'],
   invites: ['id', 'email', 'role', 'invitedBy', 'createdAt', 'lastSentAt', 'sendCount'],
-  teams: ['id', 'name', 'description', 'coverImage', 'lookingFor', 'creatorId', 'members', 'createdAt', 'updatedAt'],
+  // 'score' is appended LAST so existing team rows (8 cols) stay column-aligned.
+  teams: ['id', 'name', 'description', 'coverImage', 'lookingFor', 'creatorId', 'members', 'createdAt', 'updatedAt', 'score'],
   team_links: ['id', 'teamId', 'createdBy', 'title', 'url', 'description', 'createdAt'],
   team_posts: ['id', 'teamId', 'createdBy', 'content', 'createdAt'],
   messages: ['id', 'senderId', 'receiverId', 'content', 'read', 'createdAt'],
   announcements: ['id', 'title', 'content', 'type', 'authorId', 'isPinned', 'isPublished', 'createdAt', 'updatedAt'],
+  // Admin wallet broadcasts — the message shown as the card's LATEST field and
+  // pushed to Google/Apple wallets. This tab doubles as the send history.
+  wallet_pushes: ['id', 'message', 'sentBy', 'sentAt', 'googleCount', 'appleCount'],
   options: ['category', 'value'],
 };
 
@@ -117,12 +121,22 @@ function handle_(params) {
       return json_({ ok: false, error: 'unknown_project', message: 'Unknown project: ' + slug });
     }
 
-    var ctx = { email: null, user: null, isAdmin: false };
-    var email = verifyToken_(params.token);
-    if (email) {
-      ctx.email = email;
-      ctx.user = PROJ ? findUserByEmail_(email) : null;
-      ctx.isAdmin = isAdminEmail_(email) || (ctx.user && hasRole_(ctx.user, 'admin'));
+    var ctx = { email: null, authEmail: null, user: null, isAdmin: false };
+    var authEmail = verifyToken_(params.token);
+    if (authEmail) {
+      // A person may sign in with their personal email OR their minted
+      // @designthinking.lk workspace account. Both resolve to the same primary
+      // identity (personal stays primary); authEmail keeps the raw address.
+      ctx.authEmail = authEmail;
+      ctx.email = canonicalEmail_(authEmail);
+      if (PROJ) {
+        ctx.user = findUserByEmail_(ctx.email);
+        // Directory link missing (e.g. write failed) but the project row still
+        // carries the workEmail — match on it and adopt its personal email.
+        if (!ctx.user) ctx.user = findUserByWorkEmail_(authEmail);
+        if (ctx.user) ctx.email = String(ctx.user.email).toLowerCase();
+      }
+      ctx.isAdmin = isAdminEmail_(ctx.email) || isAdminEmail_(authEmail) || (ctx.user && hasRole_(ctx.user, 'admin'));
       if (ctx.user) touchPresence_(ctx.user.id); // best-effort online marker
     }
 
@@ -217,14 +231,15 @@ var AUTH_REQUIRED = {
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
   ann_create: 1, ann_update: 1, ann_delete: 1,
   admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
-  admin_assign_team: 1,
+  admin_assign_team: 1, admin_set_score: 1, admin_wallet_push: 1, wallet_push_history: 1,
   admin_invite: 1, admin_resend_invite: 1, admin_revoke_invite: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
+  wallet_link: 1,
 };
 
 var ADMIN_REQUIRED = {
   admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
-  admin_assign_team: 1,
+  admin_assign_team: 1, admin_set_score: 1, admin_wallet_push: 1, wallet_push_history: 1,
   admin_invite: 1, admin_resend_invite: 1, admin_revoke_invite: 1,
   admin_list_projects: 1, admin_create_project: 1, admin_update_project: 1,
 };
@@ -411,6 +426,74 @@ var ACTIONS = {
     }
     cache.put(key, JSON.stringify(out), 300);
     return out;
+  },
+
+  /** Mint a short-lived (30 min) wallet link for the signed-in user. The
+   *  profile card renders this URL as a QR so the user can scan it with their
+   *  phone and land on the #/wallet handoff page (which then adds the pass to
+   *  Google/Apple Wallet). Auth-gated; the token binds to the user id. */
+  wallet_link: function (params, ctx) {
+    if (!ctx.user) return { ok: false, error: 'noprofile', message: 'Register first.' };
+    var wt = walletSignToken_({ uid: ctx.user.id, pid: PROJ.id, exp: Date.now() + 30 * 60 * 1000 });
+    var base = walletBaseUrl_();
+    return { url: base + '/#/wallet?wt=' + encodeURIComponent(wt), token: wt, ttl: 1800 };
+  },
+
+  /** Return the Google Wallet "save" URL for a member. Deliberately NOT in
+   *  AUTH_REQUIRED — the phone that scanned the QR has no session token, so it
+   *  authenticates with the `wt` wallet token instead. Falls back to the
+   *  signed-in user when called from within the app. */
+  wallet_pass: function (params, ctx) {
+    var user = null;
+    if (params.wt) {
+      var claims = walletVerifyToken_(String(params.wt));
+      if (!claims) return { ok: false, error: 'auth', message: 'Wallet link expired — reopen the QR from your profile.' };
+      user = rowById_('users', claims.uid);
+    } else if (ctx.user) {
+      user = ctx.user;
+    }
+    if (!user) return { ok: false, error: 'auth', message: 'Sign in or scan the QR from your profile card.' };
+    try {
+      var url = walletBuildSaveUrl_(user);
+      return { url: url, google: url };
+    } catch (err) {
+      return { ok: false, error: 'server', message: 'Wallet pass failed: ' + (err && err.message || err) };
+    }
+  },
+
+  /** Apple Wallet: return the Cloud Function URL (with a signed ?at= token)
+   *  that serves the .pkpass. Same auth model as wallet_pass — `wt` from the
+   *  QR handoff, or the signed-in user. */
+  apple_pass_link: function (params, ctx) {
+    var user = null;
+    if (params.wt) {
+      var claims = walletVerifyToken_(String(params.wt));
+      if (!claims) return { ok: false, error: 'auth', message: 'Wallet link expired — reopen the QR from your profile.' };
+      user = rowById_('users', claims.uid);
+    } else if (ctx.user) {
+      user = ctx.user;
+    }
+    if (!user) return { ok: false, error: 'auth', message: 'Sign in or scan the QR from your profile card.' };
+    var fnUrl = getConfig_('APPLE_PASS_FN_URL', '');
+    if (!fnUrl) return { ok: false, error: 'unconfigured', message: 'Apple Wallet is not configured yet.' };
+    var token = walletSignAppleToken_({ uid: user.id, pid: PROJ.id, exp: Date.now() + 30 * 60 * 1000 });
+    return { url: fnUrl + (fnUrl.indexOf('?') === -1 ? '?' : '&') + 'at=' + encodeURIComponent(token) };
+  },
+
+  /** Server-to-server (Apple function only): current live fields for a serial.
+   *  HMAC-signed with WALLET_APPLE_HMAC; not a browser endpoint. */
+  wallet_fields: function (params, ctx) {
+    var serial = String(params.serial || '');
+    if (!walletVerifyAppleSig_(serial, params.ts, params.sig)) {
+      return { ok: false, error: 'forbidden', message: 'bad signature' };
+    }
+    var sep = serial.indexOf('__');
+    if (sep === -1) return { ok: false, error: 'validation', message: 'bad serial' };
+    var uid = serial.substring(sep + 2);
+    var user = rowById_('users', uid);
+    if (!user) return { ok: false, error: 'notfound', message: 'no such member' };
+    var fields = walletComputeFields_(user);
+    return { fields: fields, hash: walletFieldsHash_(fields) };
   },
 
   /** Short Claude-written description of a skill, for the Skills map's side
@@ -613,6 +696,72 @@ var ACTIONS = {
     var members = parseArr_(team.members).filter(function (id) { return id !== ctx.user.id; });
     updateRowById_('teams', team.id, { members: JSON.stringify(members), updatedAt: new Date().toISOString() });
     return { team: parseTeam_(rowById_('teams', team.id)) };
+  },
+
+  /** Admin sets a team's live score (shown on the wallet pass). Absolute value
+   *  (not a delta). The wallet refresh trigger picks the change up on its next
+   *  tick and updates every installed pass for that team's members. */
+  admin_set_score: function (params, ctx) {
+    var team = rowById_('teams', params.teamId);
+    if (!team) return { ok: false, error: 'notfound', message: 'Team not found.' };
+    var score = Math.round(Number(params.score));
+    if (!isFinite(score)) return { ok: false, error: 'validation', message: 'Score must be a number.' };
+    updateRowById_('teams', team.id, { score: score, updatedAt: new Date().toISOString() });
+    return { team: parseTeam_(rowById_('teams', team.id)) };
+  },
+
+  /** Admin wallet broadcast: log the message to the wallet_pushes history tab,
+   *  set it as the card's LATEST field, and push it to every installed pass —
+   *  Google (PATCH + addMessage) via the refresh tick, Apple (APNs) via the
+   *  Cloud Function's /internal/refresh. Returns per-wallet delivery counts. */
+  admin_wallet_push: function (params, ctx) {
+    var msg = clean_(params.message, 200);
+    if (!msg) return { ok: false, error: 'validation', message: 'Message is required.' };
+    gid_('wallet_pushes'); // ensure the tab exists before appending
+    var row = {
+      id: Utilities.getUuid(), message: msg,
+      sentBy: ctx.user ? ctx.user.id : ctx.email,
+      sentAt: new Date().toISOString(), googleCount: '', appleCount: '',
+    };
+    appendRow_('wallet_pushes', row);
+
+    // Google: refresh tick PATCHes the LATEST field + fires the message push.
+    // It mutates PROJ as it walks objects across projects, so save/restore it.
+    var g = 0, a = 0, savedProj = PROJ;
+    try { var gr = walletRefreshTick(); g = (gr && gr.pushed) || 0; } catch (e) { console.error('google push', e); }
+    PROJ = savedProj;
+
+    // Apple: trigger the function to recompute + APNs-push changed serials.
+    try {
+      var fnUrl = getConfig_('APPLE_PASS_FN_URL', '');
+      var appleSecret = PropertiesService.getScriptProperties().getProperty('WALLET_APPLE_HMAC');
+      if (fnUrl && appleSecret) {
+        var resp = UrlFetchApp.fetch(String(fnUrl).replace(/\/+$/, '') + '/internal/refresh', {
+          method: 'post', headers: { 'X-Refresh-Key': String(appleSecret).trim() }, muteHttpExceptions: true,
+        });
+        if (resp.getResponseCode() === 200) { try { a = JSON.parse(resp.getContentText()).pushed || 0; } catch (e2) {} }
+      }
+    } catch (e) { console.error('apple push', e); }
+
+    try { updateRowById_('wallet_pushes', row.id, { googleCount: String(g), appleCount: String(a) }); } catch (e) {}
+    return { ok: true, googleCount: g, appleCount: a };
+  },
+
+  /** Admin: recent wallet broadcasts (history), newest first, sender resolved. */
+  wallet_push_history: function (params, ctx) {
+    var rows;
+    try { rows = readTable_('wallet_pushes'); } catch (e) { rows = []; }
+    rows.sort(function (a, b) { return String(b.sentAt).localeCompare(String(a.sentAt)); });
+    return {
+      pushes: rows.slice(0, 50).map(function (r) {
+        var u = rowById_('users', r.sentBy);
+        return {
+          id: r.id, message: r.message, sentAt: r.sentAt,
+          sentBy: u ? u.name : (r.sentBy || ''),
+          googleCount: r.googleCount, appleCount: r.appleCount,
+        };
+      }),
+    };
   },
 
   team_detail: function (params, ctx) {
@@ -1101,6 +1250,7 @@ function parseTeam_(t) {
   var out = {};
   Object.keys(t).forEach(function (k) { out[k] = t[k]; });
   out.members = parseArr_(t.members);
+  out.score = Number(t.score) || 0;
   return out;
 }
 
@@ -1238,6 +1388,20 @@ function findUserByEmail_(email) {
   var users = readTable_('users');
   for (var i = 0; i < users.length; i++) {
     if (String(users[i].email).toLowerCase() === email) return users[i];
+  }
+  return null;
+}
+
+/** Reverse lookup: a user row whose minted workEmail matches. Lets a person
+ *  sign in with their @designthinking.lk account and still resolve to the same
+ *  row they registered under with their personal email. Project-local fallback
+ *  for when the cross-project directory has no row yet. */
+function findUserByWorkEmail_(workEmail) {
+  var key = String(workEmail || '').toLowerCase();
+  if (!key) return null;
+  var users = readTable_('users');
+  for (var i = 0; i < users.length; i++) {
+    if (String(users[i].workEmail || '').toLowerCase() === key) return users[i];
   }
   return null;
 }
@@ -1426,6 +1590,32 @@ function findDirectory_(email) {
     if (String(rows[i].email).toLowerCase() === key) return rows[i];
   }
   return null;
+}
+
+/** Reverse lookup: the directory row whose minted workEmail matches. This is
+ *  the cross-project link between a person's personal (primary) email and their
+ *  @designthinking.lk workspace account — see canonicalEmail_. */
+function findDirectoryByWorkEmail_(workEmail) {
+  var key = String(workEmail || '').toLowerCase();
+  if (!key) return null;
+  var rows = readRegistry_('directory');
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i].workEmail || '').toLowerCase() === key) return rows[i];
+  }
+  return null;
+}
+
+/** Map whatever address a person signed in with to their PRIMARY identity.
+ *  Personal email (how they were invited and registered) stays primary; a
+ *  minted @designthinking.lk workspace login resolves back to it via the
+ *  directory. Google can't alias an external personal account to a Workspace
+ *  one, so this app-level link is what makes both sign-ins the same person.
+ *  Unknown addresses pass through unchanged (uninvited → invite-only card). */
+function canonicalEmail_(authEmail) {
+  var lower = String(authEmail || '').toLowerCase();
+  if (!lower) return lower;
+  var dir = findDirectoryByWorkEmail_(lower);
+  return dir ? String(dir.email).toLowerCase() : lower;
 }
 
 /** Insert-or-patch a directory row. Fields not in patch are preserved. */
@@ -1824,20 +2014,20 @@ function sendWorkspaceCreds_(to, firstName, workEmail, password) {
     var ev = escapeHtmlA_(PROJ.name);
     var html =
       '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#0E0F11">' +
-      '<h2 style="color:#6100FF;margin:0 0 6px">Your ' + ev + ' chat account</h2>' +
+      '<h2 style="color:#6100FF;margin:0 0 6px">Your ' + ev + ' workshop account</h2>' +
       '<p>Hi ' + escapeHtmlA_(firstName) + ',</p>' +
-      '<p>We’ve created a workshop Google account for you so you can message mentors and other participants in Google Chat during ' + ev + '.</p>' +
+      '<p>We’ve created a workshop Google account for you as part of your ' + ev + ' registration. Use it to sign in to the ' + ev + ' site and to message mentors and other participants in Google Chat.</p>' +
       '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;border-collapse:collapse">' +
-      '<tr><td style="padding:8px 14px;background:#F4F1FB;border-radius:8px 8px 0 0;font-size:13px;color:#555">Sign in at <b>chat.google.com</b> with</td></tr>' +
+      '<tr><td style="padding:8px 14px;background:#F4F1FB;border-radius:8px 8px 0 0;font-size:13px;color:#555">Sign in with</td></tr>' +
       '<tr><td style="padding:12px 14px;background:#F8F7FC;font-size:16px"><b>' + escapeHtmlA_(workEmail) + '</b></td></tr>' +
       '<tr><td style="padding:12px 14px;background:#F4F1FB;border-radius:0 0 8px 8px;font-size:16px">Temporary password: <b>' + escapeHtmlA_(password) + '</b></td></tr>' +
       '</table>' +
-      '<p style="font-size:14px;color:#555">You’ll be asked to set a new password on first sign-in. This account is just for workshop messaging — you keep using your own Google account on the ' + ev + ' site.</p>' +
+      '<p style="font-size:14px;color:#555">You’ll be asked to set a new password on first sign-in. It’s the same registration either way — signing in to the ' + ev + ' site with this account or with your own Google account (' + escapeHtmlA_(to) + ') both bring you to your profile.</p>' +
       '<p style="font-size:13px;color:#888;margin-top:22px">' + ev + ' · Augmented Human Lab</p>' +
       '</div>';
     MailApp.sendEmail({
       to: to,
-      subject: 'Your ' + PROJ.name + ' workshop chat account',
+      subject: 'Your ' + PROJ.name + ' workshop account',
       htmlBody: html,
       name: PROJ.name,
     });
@@ -1908,17 +2098,17 @@ function sendWorkspaceWelcomeBack_(to, firstName, workEmail) {
       '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#0E0F11">' +
       '<h2 style="color:#6100FF;margin:0 0 6px">Welcome back to ' + ev + '</h2>' +
       '<p>Hi ' + escapeHtmlA_(firstName) + ',</p>' +
-      '<p>Good news — the workshop chat account you got at a previous workshop works for ' + ev + ' too.</p>' +
+      '<p>Good news — the workshop account you got at a previous workshop works for ' + ev + ' too. Use it to sign in to the ' + ev + ' site and to message people in Google Chat.</p>' +
       '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0;border-collapse:collapse">' +
-      '<tr><td style="padding:8px 14px;background:#F4F1FB;border-radius:8px 8px 0 0;font-size:13px;color:#555">Sign in at <b>chat.google.com</b> with</td></tr>' +
+      '<tr><td style="padding:8px 14px;background:#F4F1FB;border-radius:8px 8px 0 0;font-size:13px;color:#555">Sign in with</td></tr>' +
       '<tr><td style="padding:12px 14px;background:#F8F7FC;border-radius:0 0 8px 8px;font-size:16px"><b>' + escapeHtmlA_(workEmail) + '</b></td></tr>' +
       '</table>' +
-      '<p style="font-size:14px;color:#555">Use the password you set last time. Forgotten it? Reply to this email and the organizers will reset it for you.</p>' +
+      '<p style="font-size:14px;color:#555">Use the password you set last time — or just sign in with your own Google account (' + escapeHtmlA_(to) + '); both reach the same ' + ev + ' registration. Forgotten the password? Reply to this email and the organizers will reset it for you.</p>' +
       '<p style="font-size:13px;color:#888;margin-top:22px">' + ev + ' · Augmented Human Lab</p>' +
       '</div>';
     MailApp.sendEmail({
       to: to,
-      subject: 'Your ' + PROJ.name + ' workshop chat account',
+      subject: 'Your ' + PROJ.name + ' workshop account',
       htmlBody: html,
       name: PROJ.name,
     });

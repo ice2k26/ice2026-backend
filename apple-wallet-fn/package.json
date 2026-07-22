@@ -1,0 +1,20 @@
+{
+  "name": "ice-apple-wallet-fn",
+  "version": "0.1.0",
+  "description": "Cloud Function: signs Apple Wallet (.pkpass) ICE member cards AND hosts the PassKit web service (live updates via APNs).",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "start": "functions-framework --target=iceApplePass --port=8080",
+    "deploy": "gcloud functions deploy iceApplePass --gen2 --runtime=nodejs20 --region=asia-southeast1 --source=. --entry-point=iceApplePass --trigger-http --allow-unauthenticated --memory=512Mi --set-secrets='ICE_PASS_P12=ice-pass-p12:latest,ICE_PASS_P12_PASSWORD=ice-pass-p12-password:latest,ICE_APPLE_HMAC=ice-apple-hmac:latest' --set-env-vars='APPLE_TEAM_ID=9B4A86RFZ8,ICE_API_URL=https://script.google.com/macros/s/AKfycbz0THh0OrmG8umv5ZomVvv1kQu7Ogs1jYp2tKqJFOe6gAMWGnL5Y5_Ww5hZOFVeNSA/exec'"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.4.0",
+    "@google-cloud/firestore": "^7.9.0",
+    "passkit-generator": "^3.4.0",
+    "node-forge": "^1.3.1"
+  }
+}
