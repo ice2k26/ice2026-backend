@@ -64,6 +64,10 @@ var TABLES = {
   teams: ['id', 'name', 'description', 'coverImage', 'lookingFor', 'creatorId', 'members', 'createdAt', 'updatedAt', 'score'],
   team_links: ['id', 'teamId', 'createdBy', 'title', 'url', 'description', 'createdAt'],
   team_posts: ['id', 'teamId', 'createdBy', 'content', 'createdAt'],
+  // The six workshop project cards at #/projects. `slot` (0–5) is the display
+  // order and also picks the owning team (teams sorted by name, by index), so
+  // that team's members — or an admin — may edit title/description/color.
+  team_projects: ['id', 'slot', 'title', 'description', 'color', 'updatedBy', 'updatedAt'],
   messages: ['id', 'senderId', 'receiverId', 'content', 'read', 'createdAt'],
   announcements: ['id', 'title', 'content', 'type', 'authorId', 'isPinned', 'isPublished', 'createdAt', 'updatedAt'],
   // Admin wallet broadcasts — the message shown as the card's LATEST field and
@@ -83,6 +87,17 @@ var DEFAULT_OPTIONS = {
   ],
   gender: ['Female', 'Male', 'Non-binary', 'Prefer not to say'],
 };
+
+// Seeded into the "team_projects" tab on first read. Each card is owned by the
+// team at the same sorted index (slot); its members (or an admin) may edit it.
+var DEFAULT_TEAM_PROJECTS = [
+  { title: 'Smart Mobility', description: 'Rethinking how the city moves — accessible transit for everyone.' },
+  { title: 'CareConnect', description: 'Bridging patients and caregivers with human-centred health tools.' },
+  { title: 'AgriSense', description: 'Data-driven decisions for smallholder farmers.' },
+  { title: 'EduPlay', description: 'Learning through play — creative classrooms beyond the textbook.' },
+  { title: 'Circular Living', description: 'Designing waste out of everyday life, one household at a time.' },
+  { title: 'FinAccess', description: 'Everyday finance for the unbanked and underserved.' },
+];
 
 // workEmail is public: it's a workshop chat handle other participants DM.
 var USER_PUBLIC_FIELDS = ['id', 'name', 'image', 'bio', 'skills', 'affiliation', 'expertise', 'links', 'video', 'role', 'createdAt', 'workEmail'];
@@ -228,6 +243,7 @@ var AUTH_REQUIRED = {
   me: 1, register: 1, update_profile: 1, upload_image: 1, check_url: 1, check_email: 1, persona: 1,
   create_team: 1, update_team: 1, delete_team: 1, join_team: 1, leave_team: 1,
   team_link_add: 1, team_link_delete: 1, team_post_add: 1,
+  team_project_update: 1,
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
   ann_create: 1, ann_update: 1, ann_delete: 1,
   admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
@@ -366,6 +382,7 @@ var ACTIONS = {
       isAdmin: !!ctx.isAdmin,
       project: projectPublic_(),
       projects: listVisibleProjects_(ctx),
+      teamProjects: readTeamProjects_(),
       prefill: prefill,
       // Links to the backing spreadsheet + uploads Drive folder — admins only.
       dbUrl: ctx.isAdmin ? ('https://docs.google.com/spreadsheets/d/' + dbId_() + '/edit') : undefined,
@@ -665,6 +682,35 @@ var ACTIONS = {
     if (params.lookingFor !== undefined) patch.lookingFor = clean_(params.lookingFor, 500);
     updateRowById_('teams', team.id, patch);
     return { team: parseTeam_(rowById_('teams', team.id)) };
+  },
+
+  /** Edit a #/projects card. Allowed for a member of the owning team (the team
+   *  at the same sorted index as the project's slot) or any admin. */
+  team_project_update: function (params, ctx) {
+    if (!ctx.user) return { ok: false, error: 'noprofile', message: 'Register first.' };
+    var slot = Number(params.slot);
+    if (!(slot >= 0 && slot < DEFAULT_TEAM_PROJECTS.length)) return { ok: false, error: 'validation', message: 'Unknown project.' };
+    var team = teamForSlot_(slot);
+    if (!(ctx.isAdmin || (team && isTeamMember_(team, ctx.user.id)))) {
+      return { ok: false, error: 'forbidden', message: 'Only this project\'s team can edit it.' };
+    }
+    var proj = null;
+    readTeamProjects_().forEach(function (p) { if (p.slot === slot) proj = p; });
+    if (!proj) return { ok: false, error: 'notfound', message: 'Project not found.' };
+    var patch = { updatedBy: ctx.user.id, updatedAt: new Date().toISOString() };
+    if (params.title !== undefined) {
+      var title = clean_(params.title, 80);
+      if (!title) return { ok: false, error: 'validation', message: 'Title cannot be empty.' };
+      patch.title = title;
+    }
+    if (params.description !== undefined) patch.description = clean_(params.description, 300);
+    if (params.color !== undefined) {
+      var color = clean_(params.color, 10);
+      if (!/^pc-[1-6]$/.test(color)) return { ok: false, error: 'validation', message: 'Unknown colour.' };
+      patch.color = color;
+    }
+    updateRowById_('team_projects', proj.id, patch);
+    return { teamProjects: readTeamProjects_() };
   },
 
   delete_team: function (params, ctx) {
@@ -1862,6 +1908,38 @@ function readOptions_() {
   });
   cache.put(tblKey_('options'), JSON.stringify(out), CACHE_TTL_SECONDS);
   return out;
+}
+
+/** The six #/projects cards, seeded from DEFAULT_TEAM_PROJECTS on first read. */
+function readTeamProjects_() {
+  gid_('team_projects'); // ensure the tab exists (creates it with the header row)
+  var rows = readTable_('team_projects', true);
+  if (!rows.length) {
+    var now = new Date().toISOString();
+    DEFAULT_TEAM_PROJECTS.forEach(function (p, i) {
+      appendRow_('team_projects', {
+        id: Utilities.getUuid(), slot: String(i),
+        title: p.title, description: p.description, color: 'pc-' + (i + 1),
+        updatedBy: '', updatedAt: now,
+      });
+    });
+    rows = readTable_('team_projects', true);
+  }
+  return rows.map(function (p) {
+    var out = {};
+    Object.keys(p).forEach(function (k) { out[k] = p[k]; });
+    out.slot = Number(p.slot) || 0;
+    return out;
+  }).sort(function (a, b) { return a.slot - b.slot; });
+}
+
+/** The team that owns project slot i: teams sorted by name (== the frontend's
+ *  homeTeams()) taken by index. undefined when fewer teams than slots exist. */
+function teamForSlot_(slot) {
+  var teams = readTable_('teams').slice().sort(function (a, b) {
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+  return teams[slot];
 }
 
 // ----------------------------------------------------------- persona (LLM)
