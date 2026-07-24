@@ -45,6 +45,9 @@ var REGISTRY_TABS = {
 var PROJ = null;
 
 var MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+// Team pitch videos (≤30s, checked client-side). Kept modest so the single
+// base64 POST stays well under the Apps Script request ceiling.
+var MAX_VIDEO_BYTES = 25 * 1024 * 1024;
 var CACHE_TTL_SECONDS = 60;
 
 // Workshop Google Workspace: on registration we mint firstname@designthinking.lk
@@ -67,7 +70,9 @@ var TABLES = {
   // The six workshop project cards at #/projects. `slot` (0–5) is the display
   // order and also picks the owning team (teams sorted by name, by index), so
   // that team's members — or an admin — may edit title/description/color.
-  team_projects: ['id', 'slot', 'title', 'description', 'color', 'updatedBy', 'updatedAt'],
+  // 'video' appended LAST so existing 7-col rows stay column-aligned. Holds a
+  // Drive-hosted (googleusercontent) URL for the team's uploaded pitch video.
+  team_projects: ['id', 'slot', 'title', 'description', 'color', 'updatedBy', 'updatedAt', 'video'],
   messages: ['id', 'senderId', 'receiverId', 'content', 'read', 'createdAt'],
   announcements: ['id', 'title', 'content', 'type', 'authorId', 'isPinned', 'isPublished', 'createdAt', 'updatedAt'],
   // Admin wallet broadcasts — the message shown as the card's LATEST field and
@@ -243,7 +248,7 @@ var AUTH_REQUIRED = {
   me: 1, register: 1, update_profile: 1, upload_image: 1, check_url: 1, check_email: 1, persona: 1,
   create_team: 1, update_team: 1, delete_team: 1, join_team: 1, leave_team: 1,
   team_link_add: 1, team_link_delete: 1, team_post_add: 1,
-  team_project_update: 1,
+  team_project_update: 1, upload_project_video: 1,
   msg_send: 1, msg_inbox: 1, msg_thread: 1,
   ann_create: 1, ann_update: 1, ann_delete: 1,
   admin_add_role: 1, admin_remove_role: 1, admin_delete_user: 1, admin_set_config: 1, admin_provision_email: 1,
@@ -711,6 +716,35 @@ var ACTIONS = {
     }
     updateRowById_('team_projects', proj.id, patch);
     return { teamProjects: readTeamProjects_() };
+  },
+
+  /** Upload a team's pitch video to the project's Drive uploads folder and save
+   *  its (public) URL on the project row. Same team-or-admin guard. Duration is
+   *  validated client-side (≤30s); here we just cap the byte size. */
+  upload_project_video: function (params, ctx) {
+    if (!ctx.user) return { ok: false, error: 'noprofile', message: 'Register first.' };
+    var slot = Number(params.slot);
+    if (!(slot >= 0 && slot < DEFAULT_TEAM_PROJECTS.length)) return { ok: false, error: 'validation', message: 'Unknown project.' };
+    var team = teamForSlot_(slot);
+    if (!(ctx.isAdmin || (team && isTeamMember_(team, ctx.user.id)))) {
+      return { ok: false, error: 'forbidden', message: 'Only this project\'s team can edit it.' };
+    }
+    var data = String(params.data || '');
+    var m = data.match(/^data:([-\w.+/]+);base64,(.*)$/);
+    var mime = m ? m[1] : String(params.mimeType || '');
+    var b64 = m ? m[2] : data;
+    if (!/^video\//.test(mime)) return { ok: false, error: 'validation', message: 'Only video files are allowed.' };
+    var bytes = Utilities.base64Decode(b64);
+    if (bytes.length > MAX_VIDEO_BYTES) return { ok: false, error: 'validation', message: 'Video must be under 25 MB.' };
+    var name = 'project-' + slot + '-' + (clean_(params.filename, 60) || 'video') + '-' + Date.now();
+    var blob = Utilities.newBlob(bytes, mime, name);
+    var file = Drive.Files.create({ name: name, parents: [uploadsFolderId_()] }, blob);
+    Drive.Permissions.create({ role: 'reader', type: 'anyone' }, file.id);
+    var url = 'https://lh3.googleusercontent.com/d/' + file.id;
+    var proj = null;
+    readTeamProjects_().forEach(function (p) { if (p.slot === slot) proj = p; });
+    if (proj) updateRowById_('team_projects', proj.id, { video: url, updatedBy: ctx.user.id, updatedAt: new Date().toISOString() });
+    return { url: url, fileId: file.id, teamProjects: readTeamProjects_() };
   },
 
   delete_team: function (params, ctx) {
@@ -1920,7 +1954,7 @@ function readTeamProjects_() {
       appendRow_('team_projects', {
         id: Utilities.getUuid(), slot: String(i),
         title: p.title, description: p.description, color: 'pc-' + (i + 1),
-        updatedBy: '', updatedAt: now,
+        updatedBy: '', updatedAt: now, video: '',
       });
     });
     rows = readTable_('team_projects', true);
