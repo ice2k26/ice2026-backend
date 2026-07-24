@@ -70,9 +70,10 @@ var TABLES = {
   // The six workshop project cards at #/projects. `slot` (0–5) is the display
   // order and also picks the owning team (teams sorted by name, by index), so
   // that team's members — or an admin — may edit title/description/color.
-  // 'video' appended LAST so existing 7-col rows stay column-aligned. Holds a
-  // Drive-hosted (googleusercontent) URL for the team's uploaded pitch video.
-  team_projects: ['id', 'slot', 'title', 'description', 'color', 'updatedBy', 'updatedAt', 'video'],
+  // New columns are appended LAST so existing rows stay column-aligned. 'video'
+  // is a Drive URL; 'description' is the short one, 'fullDescription' the long
+  // one; 'website' + 'websiteOk' (reachability flag, '1'/'' set on save).
+  team_projects: ['id', 'slot', 'title', 'description', 'color', 'updatedBy', 'updatedAt', 'video', 'fullDescription', 'website', 'websiteOk'],
   messages: ['id', 'senderId', 'receiverId', 'content', 'read', 'createdAt'],
   announcements: ['id', 'title', 'content', 'type', 'authorId', 'isPinned', 'isPublished', 'createdAt', 'updatedAt'],
   // Admin wallet broadcasts — the message shown as the card's LATEST field and
@@ -721,6 +722,15 @@ var ACTIONS = {
         return { ok: false, error: 'validation', message: 'Unrecognised video URL.' };
       }
       patch.video = vid;
+    }
+    if (params.fullDescription !== undefined) patch.fullDescription = clean_(params.fullDescription, 600);
+    // Website: normalise, then curl-check it. A broken URL still saves but is
+    // flagged (websiteOk='') so the view can show a warning.
+    if (params.website !== undefined) {
+      var web = clean_(params.website, 300);
+      if (web && !/^https?:\/\//i.test(web)) web = 'https://' + web;
+      patch.website = web;
+      patch.websiteOk = web ? (urlReachable_(web) ? '1' : '') : '';
     }
     updateRowById_('team_projects', proj.id, patch);
     return { teamProjects: readTeamProjects_() };
@@ -1962,7 +1972,7 @@ function readTeamProjects_() {
       appendRow_('team_projects', {
         id: Utilities.getUuid(), slot: String(i),
         title: p.title, description: p.description, color: 'pc-' + (i + 1),
-        updatedBy: '', updatedAt: now, video: '',
+        updatedBy: '', updatedAt: now, video: '', fullDescription: '', website: '', websiteOk: '',
       });
     });
     rows = readTable_('team_projects', true);
@@ -1973,6 +1983,22 @@ function readTeamProjects_() {
     out.slot = Number(p.slot) || 0;
     return out;
   }).sort(function (a, b) { return a.slot - b.slot; });
+}
+
+/** True if a URL responds without a 404/410 (or a hard connection failure).
+ *  Same policy as the check_url action — bot-blocked hosts still count as live. */
+function urlReachable_(url) {
+  if (!/^https?:\/\//i.test(url)) return false;
+  try {
+    var resp = UrlFetchApp.fetch(url, {
+      method: 'get', followRedirects: true, muteHttpExceptions: true, validateHttpsCertificates: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ICE-linkcheck/1.0; +https://ice.designthinking.lk)' },
+    });
+    var code = resp.getResponseCode();
+    return !(code === 404 || code === 410);
+  } catch (err) {
+    return false;
+  }
 }
 
 /** The team that owns project slot i: teams sorted by name (== the frontend's
