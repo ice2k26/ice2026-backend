@@ -714,6 +714,14 @@ var ACTIONS = {
       if (!/^pc-[1-6]$/.test(color)) return { ok: false, error: 'validation', message: 'Unknown colour.' };
       patch.color = color;
     }
+    // '' clears the pitch video (Remove); a non-empty value must be a Drive URL.
+    if (params.video !== undefined) {
+      var vid = clean_(params.video, 400);
+      if (vid && !/^https:\/\/(lh3\.googleusercontent\.com|drive\.(google|usercontent\.google)\.com)\//.test(vid)) {
+        return { ok: false, error: 'validation', message: 'Unrecognised video URL.' };
+      }
+      patch.video = vid;
+    }
     updateRowById_('team_projects', proj.id, patch);
     return { teamProjects: readTeamProjects_() };
   },
